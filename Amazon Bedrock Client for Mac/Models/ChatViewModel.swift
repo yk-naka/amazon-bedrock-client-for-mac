@@ -205,6 +205,12 @@ class ChatViewModel: ObservableObject {
     private var editMessageNotification: AnyCancellable?
     private var deleteMessageNotification: AnyCancellable?
 
+    // Edit dialog state
+    @Published var isEditDialogVisible: Bool = false
+    @Published var editingMessageId: UUID?
+    @Published var editingMessageText: String = ""
+    @Published var isEditingUserMessage: Bool = false
+
     // Format usage information for display
     private func formatUsageString(_ usage: UsageInfo) -> String {
         var parts: [String] = []
@@ -324,149 +330,6 @@ class ChatViewModel: ObservableObject {
             }
     }
 
-    // MARK: - Edit / Delete Handlers
-
-    /// Handle Edit action triggered from MessageView.
-    /// - If the target is a user message:
-    ///   - Remove that message and all following messages from both UI and stored conversation history.
-    ///   - Prefill `userInput` with the provided text and immediately re-send it (repost) so the model will generate a response.
-    /// - If the target is an assistant message:
-    ///   - Update the assistant message text in UI and storage. No deletion or re-generation is performed.
-    private func handleEditMessage(messageId: UUID, messageText: String, isUserMessage: Bool) {
-        // Ensure we're on main actor (ChatViewModel is @MainActor)
-        // Find index in UI messages
-        if let uiIndex = messages.firstIndex(where: { $0.id == messageId }) {
-            if isUserMessage {
-                // Remove from UI from uiIndex to end
-                messages.removeSubrange(uiIndex..<messages.count)
-
-                // Remove from persisted conversation history (unified format)
-                if var history = chatManager.getConversationHistory(for: chatId) {
-                    if let histIndex = history.messages.firstIndex(where: { $0.id == messageId }) {
-                        history.messages.removeSubrange(histIndex..<history.messages.count)
-                        history.lastUpdated = Date()
-                        chatManager.saveConversationHistory(history, for: chatId)
-                    }
-                } else {
-                    // Fallback to legacy files: remove messages from file-based list
-                    var legacy = chatManager.getMessages(for: chatId)
-                    if let legacyIndex = legacy.firstIndex(where: { $0.id == messageId }) {
-                        legacy.removeSubrange(legacyIndex..<legacy.count)
-                        // Save via ChatManager's legacy save (private), so use update by rewriting unified history
-                        var newHistory = ConversationHistory(
-                            chatId: chatId, modelId: chatModel.id, messages: [])
-                        for m in legacy {
-                            let role: Message.Role = m.user == "User" ? .user : .assistant
-                            let unified = Message(
-                                id: m.id,
-                                text: m.text,
-                                role: role,
-                                timestamp: m.sentTime,
-                                isError: m.isError,
-                                thinking: m.thinking,
-                                thinkingSignature: m.signature,
-                                imageBase64Strings: m.imageBase64Strings,
-                                documentBase64Strings: m.documentBase64Strings,
-                                documentFormats: m.documentFormats,
-                                documentNames: m.documentNames,
-                                toolUse: m.toolUse.map { tu in
-                                    Message.ToolUse(
-                                        toolId: tu.id, toolName: tu.name, inputs: tu.input,
-                                        result: m.toolResult)
-                                }
-                            )
-                            newHistory.addMessage(unified)
-                        }
-                        chatManager.saveConversationHistory(newHistory, for: chatId)
-                        // Also update UI messages to match legacy array
-                        messages = legacy
-                    }
-                }
-
-                // Prefill input with edited text and re-send immediately
-                userInput = messageText
-                // Trigger send to repost the edited message
-                sendMessage()
-            } else {
-                // Assistant message edit: update UI and persisted history without deleting or re-generating
-                messages[uiIndex].text = messageText
-                // Update unified history if exists
-                if var history = chatManager.getConversationHistory(for: chatId) {
-                    if let histIndex = history.messages.firstIndex(where: { $0.id == messageId }) {
-                        history.messages[histIndex].text = messageText
-                        history.lastUpdated = Date()
-                        chatManager.saveConversationHistory(history, for: chatId)
-                    } else {
-                        // If not found, try updating by id via helper
-                        chatManager.updateMessageText(
-                            for: chatId, messageId: messageId, newText: messageText)
-                    }
-                } else {
-                    // Fallback
-                    chatManager.updateMessageText(
-                        for: chatId, messageId: messageId, newText: messageText)
-                }
-            }
-
-            // Notify UI to refresh
-            objectWillChange.send()
-        }
-    }
-
-    /// Handle Delete action triggered from MessageView.
-    /// Deletes the specified message and all messages after it from UI and persisted history.
-    private func handleDeleteMessage(messageId: UUID, isUserMessage: Bool) {
-        // Find index in UI messages
-        if let uiIndex = messages.firstIndex(where: { $0.id == messageId }) {
-            // Remove from UI
-            messages.removeSubrange(uiIndex..<messages.count)
-
-            // Remove from unified conversation history
-            if var history = chatManager.getConversationHistory(for: chatId) {
-                if let histIndex = history.messages.firstIndex(where: { $0.id == messageId }) {
-                    history.messages.removeSubrange(histIndex..<history.messages.count)
-                    history.lastUpdated = Date()
-                    chatManager.saveConversationHistory(history, for: chatId)
-                }
-            } else {
-                // Fallback: remove from legacy messages and save
-                var legacy = chatManager.getMessages(for: chatId)
-                if let legacyIndex = legacy.firstIndex(where: { $0.id == messageId }) {
-                    legacy.removeSubrange(legacyIndex..<legacy.count)
-                    // Build new ConversationHistory and save
-                    var newHistory = ConversationHistory(
-                        chatId: chatId, modelId: chatModel.id, messages: [])
-                    for m in legacy {
-                        let role: Message.Role = m.user == "User" ? .user : .assistant
-                        let unified = Message(
-                            id: m.id,
-                            text: m.text,
-                            role: role,
-                            timestamp: m.sentTime,
-                            isError: m.isError,
-                            thinking: m.thinking,
-                            thinkingSignature: m.signature,
-                            imageBase64Strings: m.imageBase64Strings,
-                            documentBase64Strings: m.documentBase64Strings,
-                            documentFormats: m.documentFormats,
-                            documentNames: m.documentNames,
-                            toolUse: m.toolUse.map { tu in
-                                Message.ToolUse(
-                                    toolId: tu.id, toolName: tu.name, inputs: tu.input,
-                                    result: m.toolResult)
-                            }
-                        )
-                        newHistory.addMessage(unified)
-                    }
-                    chatManager.saveConversationHistory(newHistory, for: chatId)
-                    messages = legacy
-                }
-            }
-
-            objectWillChange.send()
-        }
-    }
-
     private func loadChatModel() async {
         // Try to find existing model for up to 10 attempts
         for attempt in 0..<10 {
@@ -531,6 +394,98 @@ class ChatViewModel: ObservableObject {
     func showToolResultDetails(_ toolResult: ToolResultInfo) {
         selectedToolResult = toolResult
         isToolResultModalVisible = true
+    }
+
+    // MARK: - Model Switching
+
+    /// Switches the model for the current chat conversation
+    func switchModel(to newModelId: String, modelName: String, provider: String) {
+        logger.info("Switching model from \(chatModel.id) to \(newModelId)")
+
+        // Update the chat model
+        let updatedChatModel = ChatModel(
+            id: newModelId,
+            chatId: chatModel.chatId,  // Keep the same chat ID
+            name: modelName,
+            title: chatModel.title,
+            description: newModelId,
+            provider: provider,
+            lastMessageDate: Date()
+        )
+
+        // Update the view model's chat model
+        self.chatModel = updatedChatModel
+
+        // Update streaming capability based on new model
+        self.isStreamingEnabled = isTextGenerationModel(newModelId)
+
+        // Update the chat manager's record
+        chatManager.updateChatModel(
+            for: chatId, newModelId: newModelId, modelName: modelName, provider: provider)
+
+        // Add a system message to indicate the model switch
+        let switchMessage = MessageData(
+            id: UUID(),
+            text: "--- モデルを \(modelName) に切り替えました ---",
+            user: "System",
+            isError: false,
+            sentTime: Date()
+        )
+        addMessage(switchMessage)
+
+        // Check for model capability differences and warn user if needed
+        checkModelCapabilityChanges(from: chatModel.id, to: newModelId)
+
+        logger.info("Successfully switched to model: \(modelName)")
+    }
+
+    /// Checks for capability differences between models and shows warnings
+    private func checkModelCapabilityChanges(from oldModelId: String, to newModelId: String) {
+        var warnings: [String] = []
+
+        // Check vision support
+        let oldVisionSupport = backendModel.backend.isVisionSupported(oldModelId)
+        let newVisionSupport = backendModel.backend.isVisionSupported(newModelId)
+
+        if oldVisionSupport && !newVisionSupport {
+            warnings.append("新しいモデルは画像分析をサポートしていません")
+        }
+
+        // Check tool use support
+        let oldToolSupport = backendModel.backend.isToolUseSupported(oldModelId)
+        let newToolSupport = backendModel.backend.isToolUseSupported(newModelId)
+
+        if oldToolSupport && !newToolSupport {
+            warnings.append("新しいモデルはツール使用をサポートしていません")
+        }
+
+        // Check document chat support
+        let oldDocSupport = backendModel.backend.isDocumentChatSupported(oldModelId)
+        let newDocSupport = backendModel.backend.isDocumentChatSupported(newModelId)
+
+        if oldDocSupport && !newDocSupport {
+            warnings.append("新しいモデルはドキュメント分析をサポートしていません")
+        }
+
+        // Check reasoning support
+        let oldReasoningSupport = backendModel.backend.isReasoningSupported(oldModelId)
+        let newReasoningSupport = backendModel.backend.isReasoningSupported(newModelId)
+
+        if oldReasoningSupport && !newReasoningSupport {
+            warnings.append("新しいモデルは推論機能をサポートしていません")
+        }
+
+        // Show warnings if any
+        if !warnings.isEmpty {
+            let warningMessage = MessageData(
+                id: UUID(),
+                text: "⚠️ 注意: " + warnings.joined(separator: "、"),
+                user: "System",
+                isError: false,
+                sentTime: Date()
+            )
+            addMessage(warningMessage)
+        }
     }
 
     // MARK: - Tool Use Tracker (Made Sendable)
@@ -2297,6 +2252,198 @@ class ChatViewModel: ObservableObject {
             }
         } catch {
             logger.error("Error updating chat title: \(error)")
+        }
+    }
+
+    // MARK: - Edit/Delete Message Handlers
+
+    private func handleEditMessage(messageId: UUID, messageText: String, isUserMessage: Bool) {
+        logger.info("Handling edit message request for ID: \(messageId), isUser: \(isUserMessage)")
+
+        if isUserMessage {
+            // ユーザーメッセージの編集
+            editingMessageId = messageId
+            editingMessageText = messageText
+            isEditingUserMessage = true
+            isEditDialogVisible = true
+        } else {
+            // アシスタントメッセージの編集
+            editingMessageId = messageId
+            editingMessageText = messageText
+            isEditingUserMessage = false
+            isEditDialogVisible = true
+        }
+    }
+
+    private func handleDeleteMessage(messageId: UUID, isUserMessage: Bool) {
+        logger.info(
+            "Handling delete message request for ID: \(messageId), isUser: \(isUserMessage)")
+
+        // 指定されたメッセージ以降をすべて削除
+        guard let messageIndex = messages.firstIndex(where: { $0.id == messageId }) else {
+            logger.warning("Message with ID \(messageId) not found for deletion")
+            return
+        }
+
+        logger.info("Deleting \(messages.count - messageIndex) messages from index \(messageIndex)")
+
+        // UI上のメッセージを削除
+        messages.removeSubrange(messageIndex...)
+
+        // 会話履歴からも削除
+        Task {
+            await deleteMessagesFromHistory(fromMessageId: messageId)
+        }
+    }
+
+    func confirmEditMessage() {
+        guard let messageId = editingMessageId else {
+            logger.warning("No message ID set for editing")
+            return
+        }
+
+        logger.info("Confirming edit for message ID: \(messageId), isUser: \(isEditingUserMessage)")
+
+        if isEditingUserMessage {
+            // ユーザーメッセージの編集：該当メッセージ以降を削除して再投稿
+
+            // まず該当メッセージ以降を削除
+            handleDeleteMessage(messageId: messageId, isUserMessage: true)
+
+            // 編集されたテキストを新しいユーザー入力として設定
+            userInput = editingMessageText
+
+            // 編集ダイアログを閉じる
+            isEditDialogVisible = false
+            editingMessageId = nil
+            editingMessageText = ""
+
+            // 少し遅延を入れてからメッセージを再送信（削除処理完了を待つ）
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                self.sendMessage()
+            }
+        } else {
+            // アシスタントメッセージの編集：テキストのみ更新
+            if let index = messages.firstIndex(where: { $0.id == messageId }) {
+                messages[index].text = editingMessageText
+
+                // ストレージも更新
+                chatManager.updateMessageText(
+                    for: chatId,
+                    messageId: messageId,
+                    newText: editingMessageText
+                )
+
+                // 会話履歴も更新
+                Task {
+                    await updateMessageInHistory(messageId: messageId, newText: editingMessageText)
+                }
+
+                logger.info("Updated assistant message text for ID: \(messageId)")
+            } else {
+                logger.warning("Could not find message with ID \(messageId) in UI messages")
+            }
+
+            // 編集ダイアログを閉じる
+            isEditDialogVisible = false
+            editingMessageId = nil
+            editingMessageText = ""
+        }
+    }
+
+    func cancelEditMessage() {
+        logger.info("Cancelling edit message dialog")
+        isEditDialogVisible = false
+        editingMessageId = nil
+        editingMessageText = ""
+    }
+
+    private func deleteMessagesFromHistory(fromMessageId: UUID) async {
+        logger.info("Deleting messages from history starting from ID: \(fromMessageId)")
+
+        guard let history = chatManager.getConversationHistory(for: chatId) else {
+            logger.warning("No conversation history found for chat \(chatId)")
+            return
+        }
+
+        // 指定されたメッセージのインデックスを見つける
+        // MessageDataのIDと履歴のMessage IDを対応させる必要がある
+        // まず、UI上のメッセージインデックスを取得
+        guard let uiMessageIndex = messages.firstIndex(where: { $0.id == fromMessageId }) else {
+            logger.warning("Message with ID \(fromMessageId) not found in UI messages")
+            return
+        }
+
+        // UI上のメッセージインデックスに対応する履歴のインデックスを計算
+        // 通常、UI上のメッセージと履歴のメッセージは1:1対応しているが、
+        // ツール使用などで複数の履歴エントリが1つのUIメッセージに対応する場合がある
+
+        // 安全のため、UI上のメッセージインデックス以降の履歴を削除
+        let historyIndexToDelete = min(uiMessageIndex, history.messages.count - 1)
+
+        if historyIndexToDelete < history.messages.count {
+            var updatedHistory = history
+            let messagesToDelete = updatedHistory.messages.count - historyIndexToDelete
+            updatedHistory.messages.removeSubrange(historyIndexToDelete...)
+
+            // 更新された履歴を保存
+            chatManager.saveConversationHistory(updatedHistory, for: chatId)
+
+            logger.info(
+                "Deleted \(messagesToDelete) messages from history starting at index \(historyIndexToDelete)"
+            )
+        } else {
+            logger.warning("Invalid history index for deletion: \(historyIndexToDelete)")
+        }
+    }
+
+    private func updateMessageInHistory(messageId: UUID, newText: String) async {
+        logger.info("Updating message text in history for ID: \(messageId)")
+
+        guard let history = chatManager.getConversationHistory(for: chatId) else {
+            logger.warning("No conversation history found for chat \(chatId)")
+            return
+        }
+
+        // UI上のメッセージインデックスを取得
+        guard let uiMessageIndex = messages.firstIndex(where: { $0.id == messageId }) else {
+            logger.warning("Message with ID \(messageId) not found in UI messages")
+            return
+        }
+
+        // 履歴の対応するメッセージを更新
+        // 通常、アシスタントメッセージは履歴の最後の方にあるため、
+        // UI上のインデックスに対応する履歴のインデックスを計算
+        let historyIndex = min(uiMessageIndex, history.messages.count - 1)
+
+        var updatedHistory = history
+        if historyIndex < updatedHistory.messages.count {
+            // アシスタントメッセージの場合、roleがassistantのものを探す
+            var targetIndex = historyIndex
+
+            // 後方から検索してアシスタントメッセージを見つける
+            for i in stride(from: updatedHistory.messages.count - 1, through: historyIndex, by: -1)
+            {
+                if updatedHistory.messages[i].role == .assistant {
+                    targetIndex = i
+                    break
+                }
+            }
+
+            if targetIndex < updatedHistory.messages.count
+                && updatedHistory.messages[targetIndex].role == .assistant
+            {
+                updatedHistory.messages[targetIndex].text = newText
+
+                // 更新された履歴を保存
+                chatManager.saveConversationHistory(updatedHistory, for: chatId)
+
+                logger.info("Updated message text in history at index \(targetIndex)")
+            } else {
+                logger.warning("Could not find assistant message in history for update")
+            }
+        } else {
+            logger.warning("Invalid history index for update: \(historyIndex)")
         }
     }
 

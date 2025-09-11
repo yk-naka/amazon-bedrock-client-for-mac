@@ -5,8 +5,8 @@
 //  Created by Na, Sanghwa on 2023/10/08.
 //
 
-import SwiftUI
 import Combine
+import SwiftUI
 
 struct BottomAnchorPreferenceKey: PreferenceKey {
     typealias Value = CGFloat
@@ -22,28 +22,29 @@ struct ChatView: View {
     @StateObject private var transcribeManager = TranscribeStreamingManager()
     @StateObject private var searchEngine = SearchEngine()
     @ObservedObject var backendModel: BackendModel
-    
+
     @FocusState private var isSearchFocused: Bool
     @SwiftUI.Environment(\.colorScheme) private var colorScheme: ColorScheme
-    
+
     @State private var isAtBottom: Bool = true
-    @State private var isSearchActive: Bool = false // Add search state tracking
-    
+    @State private var isSearchActive: Bool = false  // Add search state tracking
+
     // Font size adjustment state
     @AppStorage("adjustedFontSize") private var adjustedFontSize: Int = -1
-    
+
     // Enhanced search state
     @State private var showSearchBar: Bool = false
     @State private var searchQuery: String = ""
     @State private var currentMatchIndex: Int = 0
-    @State private var searchResult: SearchResult = SearchResult(matches: [], totalMatches: 0, searchTime: 0)
+    @State private var searchResult: SearchResult = SearchResult(
+        matches: [], totalMatches: 0, searchTime: 0)
     @State private var searchDebounceTimer: Timer?
-    
+
     // Usage toast state
     @State private var showUsageToast: Bool = false
     @State private var currentUsage: String = ""
     @State private var usageToastTimer: Timer?
-    
+
     init(chatId: String, backendModel: BackendModel) {
         let sharedMediaDataSource = SharedMediaDataSource()
         _viewModel = StateObject(
@@ -56,7 +57,7 @@ struct ChatView: View {
         _sharedMediaDataSource = StateObject(wrappedValue: sharedMediaDataSource)
         self._backendModel = ObservedObject(wrappedValue: backendModel)
     }
-    
+
     var body: some View {
         ZStack(alignment: .top) {
             if showSearchBar {
@@ -64,13 +65,13 @@ struct ChatView: View {
                     .transition(.move(edge: .top).combined(with: .opacity))
                     .zIndex(10)
             }
-            
+
             VStack(spacing: 0) {
                 placeholderView
                 messageScrollView
                 messageBarView
             }
-            
+
             // Usage toast
             if showUsageToast && SettingManager.shared.showUsageInfo {
                 VStack {
@@ -86,7 +87,7 @@ struct ChatView: View {
         .onAppear {
             // Restore existing messages from disk or other storage
             viewModel.loadInitialData()
-            
+
             // Set up usage handler for toast notifications
             viewModel.usageHandler = { usage in
                 DispatchQueue.main.async {
@@ -123,11 +124,20 @@ struct ChatView: View {
         }
         .onAppear {
             registerKeyboardShortcuts()
+            setupModelSwitchNotification()
+        }
+        .sheet(isPresented: $viewModel.isEditDialogVisible) {
+            EditMessageDialog(
+                messageText: $viewModel.editingMessageText,
+                isUserMessage: viewModel.isEditingUserMessage,
+                onConfirm: viewModel.confirmEditMessage,
+                onCancel: viewModel.cancelEditMessage
+            )
         }
     }
-    
+
     // MARK: - Keyboard Shortcuts
-    
+
     private func registerKeyboardShortcuts() {
         NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
             if event.modifierFlags.contains(.command) {
@@ -148,27 +158,27 @@ struct ChatView: View {
             return event
         }
     }
-    
+
     // MARK: - Font Size Controls
-    
+
     private func increaseFontSize() {
         if adjustedFontSize < 8 {
             adjustedFontSize += 1
         }
     }
-    
+
     private func decreaseFontSize() {
         if adjustedFontSize > -4 {
             adjustedFontSize -= 1
         }
     }
-    
+
     private func resetFontSize() {
         adjustedFontSize = -1
     }
-    
+
     // MARK: - Placeholder
-    
+
     private var placeholderView: some View {
         VStack {
             if viewModel.messages.isEmpty {
@@ -180,9 +190,9 @@ struct ChatView: View {
         }
         .textSelection(.disabled)
     }
-    
+
     // MARK: - Message Scroll View
-    
+
     private var messageScrollView: some View {
         GeometryReader { outerGeo in
             ScrollViewReader { proxy in
@@ -202,7 +212,7 @@ struct ChatView: View {
             }
         }
     }
-    
+
     private func scrollableMessageList(
         outerGeo: GeometryProxy,
         proxy: ScrollViewProxy
@@ -210,12 +220,12 @@ struct ChatView: View {
         let messageList = VStack(spacing: 2) {
             ForEach(Array(viewModel.messages.enumerated()), id: \.offset) { idx, message in
                 MessageView(
-                    message: message, 
+                    message: message,
                     searchResult: getSearchResultForMessage(idx),
                     adjustedFontSize: CGFloat(adjustedFontSize)
                 )
-                    .id(idx)
-                    .frame(maxWidth: .infinity)
+                .id(idx)
+                .frame(maxWidth: .infinity)
             }
             Color.clear
                 .frame(height: 1)
@@ -224,8 +234,8 @@ struct ChatView: View {
                     outerGeo[anchor].y
                 }
         }
-            .padding()
-        
+        .padding()
+
         return ScrollView {
             messageList
         }
@@ -233,7 +243,7 @@ struct ChatView: View {
             // If the user was at bottom and not searching, wait briefly for layout and scroll down again
             if isAtBottom && searchQuery.isEmpty {
                 Task {
-                    try? await Task.sleep(nanoseconds: 50_000_000) // 0.05s
+                    try? await Task.sleep(nanoseconds: 50_000_000)  // 0.05s
                     withAnimation {
                         proxy.scrollTo("Bottom", anchor: .bottom)
                     }
@@ -254,7 +264,7 @@ struct ChatView: View {
             isAtBottom = true
         }
     }
-    
+
     private func enhancedScrollToBottomButton(
         outerGeo: GeometryProxy,
         proxy: ScrollViewProxy
@@ -277,9 +287,11 @@ struct ChatView: View {
                                 .frame(width: 32, height: 32)
                                 .background(
                                     Circle()
-                                        .fill(colorScheme == .dark ?
-                                              Color(NSColor.windowBackgroundColor).opacity(0.9) :
-                                                Color.white.opacity(0.98))
+                                        .fill(
+                                            colorScheme == .dark
+                                                ? Color(NSColor.windowBackgroundColor).opacity(0.9)
+                                                : Color.white.opacity(0.98)
+                                        )
                                         .shadow(color: .black.opacity(0.15), radius: 4, x: 0, y: 2)
                                 )
                                 .overlay(
@@ -298,7 +310,7 @@ struct ChatView: View {
             }
         }
     }
-    
+
     private var messageBarView: some View {
         MessageBarView(
             chatID: viewModel.chatId,
@@ -310,34 +322,36 @@ struct ChatView: View {
             modelId: viewModel.chatModel.id
         )
     }
-    
+
     // MARK: - Find Bar Components
-    
+
     private var searchFieldComponent: some View {
         HStack(spacing: 10) {
             Image(systemName: "magnifyingglass")
                 .foregroundStyle(.secondary)
                 .font(.system(size: 14))
-            
+
             TextField("Find in chat", text: $searchQuery)
                 .textFieldStyle(PlainTextFieldStyle())
                 .font(.system(size: 14))
                 .frame(minWidth: 140)
                 .focused($isSearchFocused)
                 .onSubmit { goToNextMatch() }
-                .onReceive(NotificationCenter.default.publisher(for: NSControl.textDidChangeNotification)) { _ in
+                .onReceive(
+                    NotificationCenter.default.publisher(for: NSControl.textDidChangeNotification)
+                ) { _ in
                     // Additional change detection for more responsive search
                 }
         }
     }
-    
+
     private var matchCounterComponent: some View {
         HStack(spacing: 4) {
             if searchResult.totalMatches > 0 {
                 Text("\(currentMatchIndex + 1) of \(searchResult.totalMatches)")
                     .font(.system(size: 12, weight: .medium))
                     .foregroundStyle(.primary)
-                
+
                 if searchResult.searchTime > 0.001 {
                     Text("(\(String(format: "%.1f", searchResult.searchTime * 1000))ms)")
                         .font(.system(size: 10))
@@ -355,13 +369,16 @@ struct ChatView: View {
         }
         .frame(minWidth: 100, alignment: .leading)
     }
-    
+
     private var navigationButtonsComponent: some View {
         HStack(spacing: 2) {
             Button(action: goToPrevMatch) {
                 Image(systemName: "chevron.up")
                     .font(.system(size: 12, weight: .medium))
-                    .foregroundColor(searchResult.totalMatches == 0 ? Color.secondary.opacity(0.5) : Color.primary)
+                    .foregroundColor(
+                        searchResult.totalMatches == 0
+                            ? Color.secondary.opacity(0.5) : Color.primary
+                    )
                     .frame(width: 24, height: 24)
                     .background(
                         RoundedRectangle(cornerRadius: 4)
@@ -371,11 +388,14 @@ struct ChatView: View {
             .buttonStyle(PlainButtonStyle())
             .disabled(searchResult.totalMatches == 0)
             .help("Previous match")
-            
+
             Button(action: goToNextMatch) {
                 Image(systemName: "chevron.down")
                     .font(.system(size: 12, weight: .medium))
-                    .foregroundColor(searchResult.totalMatches == 0 ? Color.secondary.opacity(0.5) : Color.primary)
+                    .foregroundColor(
+                        searchResult.totalMatches == 0
+                            ? Color.secondary.opacity(0.5) : Color.primary
+                    )
                     .frame(width: 24, height: 24)
                     .background(
                         RoundedRectangle(cornerRadius: 4)
@@ -395,7 +415,7 @@ struct ChatView: View {
                 )
         )
     }
-    
+
     private var doneButtonComponent: some View {
         Button(action: {
             withAnimation(.spring(response: 0.3, dampingFraction: 0.7)) {
@@ -416,7 +436,7 @@ struct ChatView: View {
                 .fill(Color(NSColor.controlBackgroundColor))
         )
     }
-    
+
     private var enhancedFindBar: some View {
         HStack(spacing: 10) {
             searchFieldComponent
@@ -431,9 +451,11 @@ struct ChatView: View {
         .padding(10)
         .background(
             RoundedRectangle(cornerRadius: 10)
-                .fill(colorScheme == .dark ?
-                      Color(NSColor.windowBackgroundColor).opacity(0.95) :
-                        Color(NSColor.windowBackgroundColor).opacity(0.95))
+                .fill(
+                    colorScheme == .dark
+                        ? Color(NSColor.windowBackgroundColor).opacity(0.95)
+                        : Color(NSColor.windowBackgroundColor).opacity(0.95)
+                )
                 .shadow(color: Color.black.opacity(0.15), radius: 5, x: 0, y: 2)
         )
         .overlay(
@@ -443,75 +465,76 @@ struct ChatView: View {
         .padding(.horizontal, 16)
         .padding(.top, 12)
     }
-    
+
     // MARK: - Enhanced Search Logic
-    
+
     private func performDebouncedSearch(query: String) {
         // Cancel previous timer
         searchDebounceTimer?.invalidate()
-        
+
         // Set new timer for debounced search
         searchDebounceTimer = Timer.scheduledTimer(withTimeInterval: 0.3, repeats: false) { _ in
             performSearch(query: query)
         }
     }
-    
+
     private func performSearch(query: String) {
         let result = searchEngine.search(query: query, in: viewModel.messages)
-        
+
         DispatchQueue.main.async {
             self.searchResult = result
             self.currentMatchIndex = 0
         }
     }
-    
+
     private func clearSearch() {
         searchQuery = ""
         searchResult = SearchResult(matches: [], totalMatches: 0, searchTime: 0)
         currentMatchIndex = 0
         searchDebounceTimer?.invalidate()
     }
-    
+
     private func getSearchResultForMessage(_ messageIndex: Int) -> SearchMatch? {
         return searchResult.matches.first { $0.messageIndex == messageIndex }
     }
-    
+
     private func handleBottomAnchorChange(_ bottomY: CGFloat, containerHeight: CGFloat) {
         let threshold: CGFloat = 50
         isAtBottom = (bottomY <= containerHeight + threshold)
     }
-    
+
     private func jumpToFirstMatch(_ result: SearchResult, proxy: ScrollViewProxy) {
         guard let firstMatch = result.matches.first else { return }
         scrollToMatch(messageIndex: firstMatch.messageIndex, matchIndex: 0, proxy: proxy)
     }
-    
+
     private func jumpToMatchIndex(_ idx: Int, proxy: ScrollViewProxy) {
         guard searchResult.totalMatches > 0 else { return }
-        
+
         // Find the message and match position for the current match index
         var currentCount = 0
         for match in searchResult.matches {
             let matchCount = match.ranges.count
             if idx < currentCount + matchCount {
                 let localMatchIndex = idx - currentCount
-                scrollToMatch(messageIndex: match.messageIndex, matchIndex: localMatchIndex, proxy: proxy)
+                scrollToMatch(
+                    messageIndex: match.messageIndex, matchIndex: localMatchIndex, proxy: proxy)
                 return
             }
             currentCount += matchCount
         }
     }
-    
+
     private func scrollToMatch(messageIndex: Int, matchIndex: Int, proxy: ScrollViewProxy) {
         // Temporarily disable auto-scroll to bottom
         let wasAtBottom = isAtBottom
         isAtBottom = false
-        
+
         withAnimation(.easeInOut(duration: 0.3)) {
             // First scroll to the message
             proxy.scrollTo(messageIndex, anchor: .center)
         }
-        
+
         // Then notify the specific message to highlight and scroll to the exact match
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
             NotificationCenter.default.post(
@@ -520,10 +543,10 @@ struct ChatView: View {
                 userInfo: [
                     "messageIndex": messageIndex,
                     "matchIndex": matchIndex,
-                    "searchQuery": self.searchQuery
+                    "searchQuery": self.searchQuery,
                 ]
             )
-            
+
             // Keep auto-scroll disabled for a bit longer to prevent interference
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
                 // Only restore auto-scroll if we were actually at bottom before
@@ -533,7 +556,7 @@ struct ChatView: View {
             }
         }
     }
-    
+
     private func goToPrevMatch() {
         guard searchResult.totalMatches > 0 else { return }
         if currentMatchIndex > 0 {
@@ -542,7 +565,7 @@ struct ChatView: View {
             currentMatchIndex = searchResult.totalMatches - 1
         }
     }
-    
+
     private func goToNextMatch() {
         guard searchResult.totalMatches > 0 else { return }
         if currentMatchIndex < searchResult.totalMatches - 1 {
@@ -551,15 +574,39 @@ struct ChatView: View {
             currentMatchIndex = 0
         }
     }
-    
+
+    // MARK: - Model Switch Notification
+
+    private func setupModelSwitchNotification() {
+        NotificationCenter.default.addObserver(
+            forName: NSNotification.Name("SwitchChatModel"),
+            object: nil,
+            queue: .main
+        ) { [weak viewModel] notification in
+            guard let viewModel = viewModel,
+                let userInfo = notification.userInfo,
+                let chatId = userInfo["chatId"] as? String,
+                let newModelId = userInfo["newModelId"] as? String,
+                let modelName = userInfo["modelName"] as? String,
+                let provider = userInfo["provider"] as? String,
+                chatId == viewModel.chatId
+            else {
+                return
+            }
+
+            // Call the switchModel method on the view model
+            viewModel.switchModel(to: newModelId, modelName: modelName, provider: provider)
+        }
+    }
+
     // MARK: - Usage Toast
-    
+
     private var usageToastView: some View {
         HStack(spacing: 8) {
             Image(systemName: "chart.bar.doc.horizontal")
                 .font(.system(size: 12))
                 .foregroundStyle(.secondary)
-            
+
             Text(currentUsage)
                 .font(.system(size: 12, weight: .medium))
                 .foregroundStyle(.primary)
@@ -569,9 +616,11 @@ struct ChatView: View {
         .padding(.vertical, 8)
         .background(
             RoundedRectangle(cornerRadius: 8)
-                .fill(colorScheme == .dark ?
-                      Color(NSColor.windowBackgroundColor).opacity(0.95) :
-                      Color(NSColor.windowBackgroundColor).opacity(0.95))
+                .fill(
+                    colorScheme == .dark
+                        ? Color(NSColor.windowBackgroundColor).opacity(0.95)
+                        : Color(NSColor.windowBackgroundColor).opacity(0.95)
+                )
                 .shadow(color: Color.black.opacity(0.15), radius: 4, x: 0, y: 2)
         )
         .overlay(
@@ -579,17 +628,17 @@ struct ChatView: View {
                 .stroke(Color.gray.opacity(0.2), lineWidth: 0.5)
         )
     }
-    
+
     private func showUsageToast(with usage: String) {
         currentUsage = usage
-        
+
         // Cancel existing timer
         usageToastTimer?.invalidate()
-        
+
         withAnimation(.spring(response: 0.3, dampingFraction: 0.7)) {
             showUsageToast = true
         }
-        
+
         // Hide after 3 seconds
         usageToastTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: false) { _ in
             withAnimation(.spring(response: 0.3, dampingFraction: 0.7)) {

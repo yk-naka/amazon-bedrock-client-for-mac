@@ -5,8 +5,8 @@
 //  Created by Na, Sanghwa on 2023/10/06.
 //
 
-import Foundation
 import AWSBedrock
+import Foundation
 
 class ChatModel: ObservableObject, Identifiable, Equatable, Hashable {
     var id: String
@@ -14,10 +14,13 @@ class ChatModel: ObservableObject, Identifiable, Equatable, Hashable {
     var name: String
     @Published var title: String
     var description: String
-    let provider: String
+    var provider: String
     @Published var lastMessageDate: Date
-    
-    init(id: String, chatId: String, name: String, title: String, description: String, provider: String, lastMessageDate: Date) {
+
+    init(
+        id: String, chatId: String, name: String, title: String, description: String,
+        provider: String, lastMessageDate: Date
+    ) {
         self.id = id
         self.chatId = chatId
         self.name = name
@@ -26,7 +29,7 @@ class ChatModel: ObservableObject, Identifiable, Equatable, Hashable {
         self.provider = provider
         self.lastMessageDate = lastMessageDate
     }
-    
+
     static func == (lhs: ChatModel, rhs: ChatModel) -> Bool {
         lhs.chatId == rhs.chatId
     }
@@ -34,20 +37,23 @@ class ChatModel: ObservableObject, Identifiable, Equatable, Hashable {
     func hash(into hasher: inout Hasher) {
         hasher.combine(chatId)
     }
-    
+
     static func fromSummary(_ summary: BedrockClientTypes.FoundationModelSummary) -> ChatModel {
         ChatModel(
             id: summary.modelId ?? "",
             chatId: UUID().uuidString,
             name: summary.modelName ?? "",
             title: "New Chat",
-            description: "\(summary.providerName ?? "") \(summary.modelName ?? "") (\(summary.modelId ?? ""))",
+            description:
+                "\(summary.providerName ?? "") \(summary.modelName ?? "") (\(summary.modelId ?? ""))",
             provider: summary.providerName ?? "",
             lastMessageDate: Date()
         )
     }
-    
-    static func fromInferenceProfile(_ profileSummary: BedrockClientTypes.InferenceProfileSummary) -> ChatModel {
+
+    static func fromInferenceProfile(_ profileSummary: BedrockClientTypes.InferenceProfileSummary)
+        -> ChatModel
+    {
         return ChatModel(
             id: profileSummary.inferenceProfileId ?? "Unknown Id",  // Provide default if nil
             chatId: UUID().uuidString,  // Generate unique chatId

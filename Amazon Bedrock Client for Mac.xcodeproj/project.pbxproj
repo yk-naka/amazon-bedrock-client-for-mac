@@ -32,6 +32,7 @@
 		79610DE82AD22A2F00993D09 /* SidebarView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 79610DD32AD22A2F00993D09 /* SidebarView.swift */; };
 		79610DEB2AD22A2F00993D09 /* MessageView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 79610DD62AD22A2F00993D09 /* MessageView.swift */; };
 		79610DED2AD230A200993D09 /* ChatView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 79610DEC2AD230A200993D09 /* ChatView.swift */; };
+		79EDITMSG2AD230A200993D09 /* EditMessageDialog.swift in Sources */ = {isa = PBXBuildFile; fileRef = 79EDITMSG2AD230A200993D10 /* EditMessageDialog.swift */; };
 		797A12B82C2DB33100494DD9 /* SettingsWindowManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 797A12B72C2DB33100494DD9 /* SettingsWindowManager.swift */; };
 		797A12BC2C2EB4C300494DD9 /* CoreDataStack.swift in Sources */ = {isa = PBXBuildFile; fileRef = 797A12BB2C2EB4C300494DD9 /* CoreDataStack.swift */; };
 		797A12BF2C2EB53800494DD9 /* ChatModel.xcdatamodeld in Sources */ = {isa = PBXBuildFile; fileRef = 797A12BD2C2EB53800494DD9 /* ChatModel.xcdatamodeld */; };
@@ -110,6 +111,7 @@
 		79610DD32AD22A2F00993D09 /* SidebarView.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = SidebarView.swift; sourceTree = "<group>"; };
 		79610DD62AD22A2F00993D09 /* MessageView.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = MessageView.swift; sourceTree = "<group>"; };
 		79610DEC2AD230A200993D09 /* ChatView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatView.swift; sourceTree = "<group>"; };
+		79EDITMSG2AD230A200993D10 /* EditMessageDialog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EditMessageDialog.swift; sourceTree = "<group>"; };
 		797A12B72C2DB33100494DD9 /* SettingsWindowManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsWindowManager.swift; sourceTree = "<group>"; };
 		797A12BB2C2EB4C300494DD9 /* CoreDataStack.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CoreDataStack.swift; sourceTree = "<group>"; };
 		797A12BE2C2EB53800494DD9 /* ChatModel.xcdatamodel */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcdatamodel; path = ChatModel.xcdatamodel; sourceTree = "<group>"; };
@@ -300,6 +302,7 @@
 				79AF97562D9E33BE00313A4C /* ImagePreview.swift */,
 				79B37BFA2DA06BB1006A7A62 /* DocumentPreview.swift */,
 				79610DEC2AD230A200993D09 /* ChatView.swift */,
+				79EDITMSG2AD230A200993D10 /* EditMessageDialog.swift */,
 				795D9C8E2BC57D3900DF38C0 /* MainView.swift */,
 				79610DD02AD22A2F00993D09 /* MessageBarView.swift */,
 				79610DD62AD22A2F00993D09 /* MessageView.swift */,
@@ -485,6 +488,7 @@
 				7954F8472AD249A7008B03D3 /* SettingManager.swift in Sources */,
 				7954F8432AD247CC008B03D3 /* AWSRegion.swift in Sources */,
 				79610DED2AD230A200993D09 /* ChatView.swift in Sources */,
+				79EDITMSG2AD230A200993D09 /* EditMessageDialog.swift in Sources */,
 				798A9CE82AD3AB4300E9D039 /* LocalHostServer.swift in Sources */,
 				79D3C7832D9C799700CB020F /* AppStateManager.swift in Sources */,
 				79E0AC5B2D63EDDC0041829A /* TranscribeStreamingManager.swift in Sources */,

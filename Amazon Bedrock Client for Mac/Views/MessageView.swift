@@ -543,42 +543,10 @@ struct MessageView: View {
             .background(messageBackground)
             .overlay(messageBorder)
 
-            // Message actions menu button for all messages (Copy/Edit/Delete)
+            // Menu button with optimized rendering
             if isHovering {
-                Menu {
-                    Button(action: copyMessageToClipboard) {
-                        Label("Copy", systemImage: "doc.on.doc")
-                    }
-
-                    Button(action: editMessage) {
-                        Label("Edit", systemImage: "pencil")
-                    }
-
-                    Button(action: deleteMessage) {
-                        Label("Delete", systemImage: "trash")
-                            .foregroundColor(.red)
-                    }
-                } label: {
-                    Image(systemName: "ellipsis")
-                        .font(.system(size: 12))
-                        .foregroundColor(
-                            colorScheme == .dark
-                                ? Color.white.opacity(0.9) : Color.black.opacity(0.8)
-                        )
-                        .padding(6)
-                        .background(
-                            Circle()
-                                .fill(
-                                    colorScheme == .dark
-                                        ? Color.gray.opacity(0.3) : Color.white.opacity(0.9)
-                                )
-                                .shadow(color: Color.black.opacity(0.15), radius: 1, x: 0, y: 1)
-                        )
-                }
-                .menuStyle(BorderlessButtonMenuStyle())
-                .offset(x: 8, y: 8)
-                .opacity(isHovering ? 1.0 : 0.0)
-                .animation(.easeInOut(duration: 0.2), value: isHovering)
+                userMessageMenuButton
+                    .transition(.opacity)
             }
         }
         .sheet(isPresented: $viewModel.isShowingImageModal) {
@@ -620,10 +588,23 @@ struct MessageView: View {
         }
     }
 
-    // Extract copy button to a separate computed property
-    private var copyButton: some View {
-        Button(action: copyMessageToClipboard) {
-            Image(systemName: "doc.on.doc")
+    // Extract menu button to a separate computed property for user messages
+    private var userMessageMenuButton: some View {
+        Menu {
+            Button(action: copyMessageToClipboard) {
+                Label("Copy", systemImage: "doc.on.doc")
+            }
+
+            Button(action: editMessage) {
+                Label("Edit", systemImage: "pencil")
+            }
+
+            Button(action: deleteMessage) {
+                Label("Delete", systemImage: "trash")
+                    .foregroundColor(.red)
+            }
+        } label: {
+            Image(systemName: "ellipsis")
                 .font(.system(size: 12))
                 .foregroundColor(
                     colorScheme == .dark ? Color.white.opacity(0.9) : Color.black.opacity(0.8)
@@ -638,7 +619,7 @@ struct MessageView: View {
                         .shadow(color: Color.black.opacity(0.15), radius: 1, x: 0, y: 1)
                 )
         }
-        .buttonStyle(PlainButtonStyle())
+        .menuStyle(BorderlessButtonMenuStyle())
         .offset(x: 8, y: 8)
     }
 
