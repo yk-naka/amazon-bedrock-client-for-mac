@@ -2532,7 +2532,7 @@ class ChatViewModel: ObservableObject {
 
         logger.info("Starting non-streaming converse request with model ID: \(chatModel.id)")
 
-        // Use the non-streaming Converse API
+        // Use the non-streaming Converse API with retry logic
         let request = AWSBedrockRuntime.ConverseInput(
             inferenceConfig: nil,
             messages: bedrockMessages,
@@ -2542,7 +2542,7 @@ class ChatViewModel: ObservableObject {
             toolConfig: toolConfig
         )
 
-        let response = try await backendModel.backend.bedrockRuntimeClient.converse(input: request)
+        let response = try await backendModel.backend.converse(input: request)
 
         // Process the response
         var responseText = ""
