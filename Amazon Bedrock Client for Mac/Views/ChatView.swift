@@ -83,6 +83,20 @@ struct ChatView: View {
                 .padding(.top, showSearchBar ? 80 : 12)
                 .allowsHitTesting(false)
             }
+
+            // Context organization progress indicator
+            if viewModel.isContextOrganizationInProgress
+                || viewModel.isContextCacheOptimizationInProgress
+            {
+                VStack {
+                    contextProgressView
+                        .transition(.move(edge: .top).combined(with: .opacity))
+                        .zIndex(6)
+                    Spacer()
+                }
+                .padding(.top, showSearchBar ? 80 : 12)
+                .allowsHitTesting(false)
+            }
         }
         .onAppear {
             // Restore existing messages from disk or other storage
@@ -597,6 +611,36 @@ struct ChatView: View {
             // Call the switchModel method on the view model
             viewModel.switchModel(to: newModelId, modelName: modelName, provider: provider)
         }
+    }
+
+    // MARK: - Context Progress View
+
+    private var contextProgressView: some View {
+        HStack(spacing: 8) {
+            ProgressView()
+                .scaleEffect(0.8)
+                .progressViewStyle(CircularProgressViewStyle())
+
+            Text(viewModel.isContextOrganizationInProgress ? "コンテキストを整理中..." : "キャッシュを最適化中...")
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(.primary)
+                .lineLimit(1)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(
+            RoundedRectangle(cornerRadius: 8)
+                .fill(
+                    colorScheme == .dark
+                        ? Color(NSColor.windowBackgroundColor).opacity(0.95)
+                        : Color(NSColor.windowBackgroundColor).opacity(0.95)
+                )
+                .shadow(color: Color.black.opacity(0.15), radius: 4, x: 0, y: 2)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(Color.blue.opacity(0.3), lineWidth: 1)
+        )
     }
 
     // MARK: - Usage Toast

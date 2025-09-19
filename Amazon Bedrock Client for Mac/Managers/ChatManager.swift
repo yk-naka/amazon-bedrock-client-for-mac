@@ -995,6 +995,61 @@ class ChatManager: ObservableObject {
         return [:]
     }
 
+    // MARK: - Message Deletion
+
+    /// Deletes messages from the specified index onwards
+    func deleteMessagesFromIndex(_ fromIndex: Int, for chatId: String) async -> Int {
+        var deletedCount = 0
+
+        // Delete from unified conversation history
+        if var history = getConversationHistory(for: chatId) {
+            let originalCount = history.messages.count
+
+            if fromIndex < originalCount && fromIndex >= 0 {
+                // Remove messages from index onwards
+                history.messages.removeSubrange(fromIndex...)
+                deletedCount = originalCount - history.messages.count
+
+                // Save updated history
+                saveConversationHistory(history, for: chatId)
+
+                logger.info(
+                    "Deleted \(deletedCount) messages from unified history for chat \(chatId)")
+            } else {
+                logger.warning(
+                    "Invalid index \(fromIndex) for chat \(chatId) with \(originalCount) messages")
+            }
+        } else {
+            // Fallback to legacy message format
+            var messages = loadMessagesFromFile(chatId: chatId)
+            let originalCount = messages.count
+
+            if fromIndex < originalCount && fromIndex >= 0 {
+                messages.removeSubrange(fromIndex...)
+                deletedCount = originalCount - messages.count
+
+                saveMessagesToFile(chatId: chatId, messages: messages)
+
+                logger.info(
+                    "Deleted \(deletedCount) messages from legacy format for chat \(chatId)")
+            } else {
+                logger.warning(
+                    "Invalid index \(fromIndex) for legacy chat \(chatId) with \(originalCount) messages"
+                )
+            }
+        }
+
+        // Update chat's last message date
+        await MainActor.run {
+            if let chatIndex = self.chats.firstIndex(where: { $0.chatId == chatId }) {
+                self.chats[chatIndex].lastMessageDate = Date()
+                self.objectWillChange.send()
+            }
+        }
+
+        return deletedCount
+    }
+
     // MARK: - File Cleanup
 
     private func deleteAllFiles(for chatId: String) {

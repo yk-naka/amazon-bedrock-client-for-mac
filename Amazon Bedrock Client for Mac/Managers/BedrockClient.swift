@@ -85,7 +85,7 @@ class BackendModel: ObservableObject {
                     alertMessage = "AWS error: \(commonRuntimeError.localizedDescription)"
                 }
             } else if let awsServiceError = error as? AWSClientRuntime.AWSServiceError {
-                alertMessage = "AWS service error: \(awsServiceError.message)"
+                alertMessage = "AWS service error: \(awsServiceError.message ?? "Unknown error")"
             } else {
                 alertMessage = "Error: \(error.localizedDescription)"
             }
@@ -279,14 +279,19 @@ class Backend: Equatable {
     }
 
     private func createBedrockRuntimeClient() throws -> BedrockRuntimeClient {
-        let config = try BedrockRuntimeClient.BedrockRuntimeClientConfiguration(
+        var config = try BedrockRuntimeClient.BedrockRuntimeClientConfiguration(
             awsCredentialIdentityResolver: self.awsCredentialIdentityResolver,
             region: self.region,
             signingRegion: self.region,
             endpoint: self.runtimeEndpoint.isEmpty ? nil : self.runtimeEndpoint
         )
+
+        // より積極的なHTTPタイムアウト設定
+        config.httpClientConfiguration.connectTimeout = 60.0  // 接続タイムアウト: 60秒
+        config.httpClientConfiguration.socketTimeout = 600.0  // ソケットタイムアウト: 600秒（10分）
+
         logger.info(
-            "Bedrock Runtime client created with region: \(self.region), runtimeEndpoint: \(self.runtimeEndpoint)"
+            "Bedrock Runtime client created with region: \(self.region), runtimeEndpoint: \(self.runtimeEndpoint), connectTimeout: 60s, socketTimeout: 600s"
         )
         return BedrockRuntimeClient(config: config)
     }
@@ -1000,16 +1005,28 @@ class Backend: Equatable {
                 }
             }
         } catch {
-            // Check if this is a ThrottlingException
-            if isThrottlingException(error) && retryCount < maxRetries {
+            // 詳細なエラーログを出力
+            logger.error("API call failed with error: \(error)")
+            if let nsError = error as NSError? {
+                logger.error(
+                    "NSError details - Domain: \(nsError.domain), Code: \(nsError.code), UserInfo: \(nsError.userInfo)"
+                )
+            }
+
+            // Check if this is a ThrottlingException or timeout error
+            if (isThrottlingException(error) || isTimeoutError(error)) && retryCount < maxRetries {
+                let errorType = isThrottlingException(error) ? "ThrottlingException" : "Timeout"
+                // より長い待機時間を設定（特にタイムアウトエラーの場合）
+                let waitTime = isThrottlingException(error) ? 60 : 45  // 60秒 for throttling, 45秒 for timeout
+
                 logger.warning(
-                    "ThrottlingException detected (attempt \(retryCount + 1)/\(maxRetries + 1)). Waiting 60 seconds before retry..."
+                    "\(errorType) detected (attempt \(retryCount + 1)/\(maxRetries + 1)). Error details: \(error.localizedDescription). Waiting \(waitTime) seconds before retry..."
                 )
 
-                // Wait for 60 seconds (1 minute)
-                try await Task.sleep(nanoseconds: 60_000_000_000)  // 60 seconds in nanoseconds
+                // Wait before retry
+                try await Task.sleep(nanoseconds: UInt64(waitTime) * 1_000_000_000)
 
-                // Retry the request
+                // Retry the request with exponential backoff
                 return try await converseStreamWithRetry(
                     withId: modelId,
                     messages: messages,
@@ -1021,9 +1038,14 @@ class Backend: Equatable {
                     maxRetries: maxRetries
                 )
             } else {
-                // If not a throttling exception or max retries exceeded, throw the error
+                // If not a retryable error or max retries exceeded, throw the error
                 if retryCount >= maxRetries {
-                    logger.error("Max retries (\(maxRetries)) exceeded for ThrottlingException")
+                    let errorType =
+                        isThrottlingException(error)
+                        ? "ThrottlingException" : isTimeoutError(error) ? "Timeout" : "Error"
+                    logger.error(
+                        "Max retries (\(maxRetries)) exceeded for \(errorType). Final error: \(error.localizedDescription)"
+                    )
                 }
                 throw error
             }
@@ -1060,6 +1082,40 @@ class Backend: Equatable {
         return false
     }
 
+    /// Check if the error is a timeout error that should be retried
+    private func isTimeoutError(_ error: Error) -> Bool {
+        let errorDescription = error.localizedDescription.lowercased()
+
+        // Check for various timeout error patterns
+        if errorDescription.contains("timed out")
+            || errorDescription.contains("timeout")
+            || errorDescription.contains("request timeout")
+            || errorDescription.contains("connection timeout")
+            || errorDescription.contains("socket timeout")
+        {
+            return true
+        }
+
+        // Check NSURLError timeout codes
+        if let nsError = error as NSError? {
+            // NSURLErrorTimedOut = -1001
+            // NSURLErrorCannotConnectToHost = -1004
+            // NSURLErrorNetworkConnectionLost = -1005
+            if nsError.code == -1001 || nsError.code == -1004 || nsError.code == -1005 {
+                return true
+            }
+        }
+
+        // Check for AWS SDK timeout errors
+        if let awsError = error as? AWSClientRuntime.AWSServiceError {
+            if let typeName = awsError.typeName?.lowercased() {
+                return typeName.contains("timeout") || typeName.contains("requesttimeout")
+            }
+        }
+
+        return false
+    }
+
     /// Non-streaming converse method with retry logic for ThrottlingException
     func converse(input: ConverseInput) async throws -> ConverseOutput {
         return try await converseWithRetry(input: input, retryCount: 0, maxRetries: 3)
@@ -1074,23 +1130,29 @@ class Backend: Equatable {
         do {
             return try await self.bedrockRuntimeClient.converse(input: input)
         } catch {
-            // Check if this is a ThrottlingException
-            if isThrottlingException(error) && retryCount < maxRetries {
+            // Check if this is a ThrottlingException or timeout error
+            if (isThrottlingException(error) || isTimeoutError(error)) && retryCount < maxRetries {
+                let errorType = isThrottlingException(error) ? "ThrottlingException" : "Timeout"
+                let waitTime = isThrottlingException(error) ? 60 : 30  // 60秒 for throttling, 30秒 for timeout
+
                 logger.warning(
-                    "ThrottlingException detected in converse (attempt \(retryCount + 1)/\(maxRetries + 1)). Waiting 60 seconds before retry..."
+                    "\(errorType) detected in converse (attempt \(retryCount + 1)/\(maxRetries + 1)). Waiting \(waitTime) seconds before retry..."
                 )
 
-                // Wait for 60 seconds (1 minute)
-                try await Task.sleep(nanoseconds: 60_000_000_000)  // 60 seconds in nanoseconds
+                // Wait before retry
+                try await Task.sleep(nanoseconds: UInt64(waitTime) * 1_000_000_000)
 
                 // Retry the request
                 return try await converseWithRetry(
                     input: input, retryCount: retryCount + 1, maxRetries: maxRetries)
             } else {
-                // If not a throttling exception or max retries exceeded, throw the error
+                // If not a retryable error or max retries exceeded, throw the error
                 if retryCount >= maxRetries {
+                    let errorType =
+                        isThrottlingException(error)
+                        ? "ThrottlingException" : isTimeoutError(error) ? "Timeout" : "Error"
                     logger.error(
-                        "Max retries (\(maxRetries)) exceeded for ThrottlingException in converse")
+                        "Max retries (\(maxRetries)) exceeded for \(errorType) in converse")
                 }
                 throw error
             }

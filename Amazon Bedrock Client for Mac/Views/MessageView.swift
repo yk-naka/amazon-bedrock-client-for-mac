@@ -324,6 +324,18 @@ struct MessageView: View {
                     Label("Delete", systemImage: "trash")
                         .foregroundColor(.red)
                 }
+
+                Divider()
+
+                Button(action: organizeContext) {
+                    Label("Organize Context", systemImage: "doc.text.magnifyingglass")
+                        .foregroundColor(.blue)
+                }
+
+                Button(action: optimizeContextCache) {
+                    Label("Optimize Cache", systemImage: "memorychip")
+                        .foregroundColor(.green)
+                }
             } label: {
                 Image(systemName: "ellipsis")
                     .font(.system(size: 12))
@@ -685,6 +697,26 @@ struct MessageView: View {
                 "messageId": message.id,
                 "isUserMessage": message.user == "User",
             ]
+        )
+    }
+
+    private func organizeContext() {
+        // Context organization機能の実装
+        // NotificationCenterを使ってChatViewModelにコンテキスト整理要求を送信
+        NotificationCenter.default.post(
+            name: NSNotification.Name("OrganizeContext"),
+            object: nil,
+            userInfo: [:]
+        )
+    }
+
+    private func optimizeContextCache() {
+        // Context cache optimization機能の実装
+        // NotificationCenterを使ってChatViewModelにコンテキストキャッシュ最適化要求を送信
+        NotificationCenter.default.post(
+            name: NSNotification.Name("OptimizeContextCache"),
+            object: nil,
+            userInfo: [:]
         )
     }
 

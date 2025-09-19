@@ -201,15 +201,20 @@ class ChatViewModel: ObservableObject {
     // Usage handler for displaying token usage information
     var usageHandler: ((String) -> Void)?
 
-    // Edit/Delete notification handlers
+    // Edit/Delete/OrganizeContext notification handlers
     private var editMessageNotification: AnyCancellable?
     private var deleteMessageNotification: AnyCancellable?
+    private var organizeContextNotification: AnyCancellable?
 
     // Edit dialog state
     @Published var isEditDialogVisible: Bool = false
     @Published var editingMessageId: UUID?
     @Published var editingMessageText: String = ""
     @Published var isEditingUserMessage: Bool = false
+
+    // Context organization state
+    @Published var isContextOrganizationInProgress: Bool = false
+    @Published var isContextCacheOptimizationInProgress: Bool = false
 
     // Format usage information for display
     private func formatUsageString(_ usage: UsageInfo) -> String {
@@ -328,6 +333,23 @@ class ChatViewModel: ObservableObject {
 
                 self.handleDeleteMessage(messageId: messageId, isUserMessage: isUserMessage)
             }
+
+        // Organize context notification
+        organizeContextNotification = NotificationCenter.default
+            .publisher(for: NSNotification.Name("OrganizeContext"))
+            .sink { [weak self] notification in
+                guard let self = self else { return }
+                self.organizeContext()
+            }
+
+        // Context cache optimization notification
+        NotificationCenter.default
+            .publisher(for: NSNotification.Name("OptimizeContextCache"))
+            .sink { [weak self] notification in
+                guard let self = self else { return }
+                self.optimizeContextCache()
+            }
+            .store(in: &cancellables)
     }
 
     private func loadChatModel() async {
@@ -892,8 +914,13 @@ class ChatViewModel: ObservableObject {
             }
         }
 
-        // Get conversation history and add new user message (implicit)
+        // Get conversation history and add new user message
         var conversationHistory = await getConversationHistory()
+
+        // Add the current user message to conversation history
+        let userBedrockMessage = BedrockMessage(role: .user, content: messageContents)
+        conversationHistory.append(userBedrockMessage)
+
         await saveConversationHistory(conversationHistory)
 
         // Get system prompt
@@ -2155,9 +2182,67 @@ class ChatViewModel: ObservableObject {
 
     private func handleModelError(_ error: Error) async {
         logger.error("Error invoking the model: \(error)")
+
+        // 詳細なエラー分析
+        var errorDetails = "Error invoking the model: \(error.localizedDescription)"
+
+        if let nsError = error as NSError? {
+            errorDetails += "\n\nError Details:"
+            errorDetails += "\n- Domain: \(nsError.domain)"
+            errorDetails += "\n- Code: \(nsError.code)"
+
+            // ValidationException の詳細分析
+            if nsError.domain.contains("ValidationException") {
+                errorDetails += "\n- Type: AWS Bedrock Runtime ValidationException"
+                errorDetails += "\n\n考えられる原因:"
+                errorDetails += "\n1. tool_use/tool_result のペアが不整合"
+                errorDetails += "\n2. メッセージの順序が不正"
+                errorDetails += "\n3. リクエストの形式が無効"
+
+                // 会話履歴の状態をログ出力
+                if let history = chatManager.getConversationHistory(for: chatId) {
+                    logger.error("Conversation history state at error:")
+                    for (index, message) in history.messages.enumerated() {
+                        if let toolUse = message.toolUse {
+                            logger.error(
+                                "Message[\(index)] \(message.role): tool_id=\(toolUse.toolId), has_result=\(toolUse.result != nil)"
+                            )
+                        } else {
+                            logger.error("Message[\(index)] \(message.role): no_tool")
+                        }
+                    }
+                } else {
+                    logger.error("No conversation history available for analysis")
+                }
+
+                errorDetails += "\n\n📋 会話履歴の状態がログに出力されました"
+            }
+
+            // タイムアウトエラーの場合の詳細情報
+            if nsError.code == -1001 {
+                errorDetails += "\n- Type: Request Timeout (NSURLErrorTimedOut)"
+                errorDetails += "\n\n対処法:"
+                errorDetails += "\n1. ネットワーク接続を確認してください"
+                errorDetails += "\n2. 複雑な質問の場合、より短い質問に分割してみてください"
+                errorDetails += "\n3. しばらく待ってから再試行してください"
+                errorDetails += "\n4. 別のモデル（Nova Pro等）を試してみてください"
+
+                if let failingURL = nsError.userInfo["NSErrorFailingURLStringKey"] as? String {
+                    errorDetails += "\n- Failing URL: \(failingURL)"
+                }
+            }
+
+            // その他の詳細情報
+            for (key, value) in nsError.userInfo {
+                if key != NSLocalizedDescriptionKey && key != "NSErrorFailingURLStringKey" {
+                    errorDetails += "\n- \(key): \(value)"
+                }
+            }
+        }
+
         let errorMessage = MessageData(
             id: UUID(),
-            text: "Error invoking the model: \(error)",
+            text: errorDetails,
             user: "System",
             isError: true,
             sentTime: Date()
@@ -2255,6 +2340,569 @@ class ChatViewModel: ObservableObject {
         }
     }
 
+    // MARK: - Context Organization
+
+    /// Organizes the conversation context by summarizing and reducing information
+    func organizeContext() {
+        guard !messages.isEmpty else {
+            logger.info("No messages to organize")
+            return
+        }
+
+        guard !isContextOrganizationInProgress else {
+            logger.info("Context organization already in progress")
+            return
+        }
+
+        isContextOrganizationInProgress = true
+
+        Task {
+            await performContextOrganization()
+        }
+    }
+
+    private func performContextOrganization() async {
+        logger.info("Starting context organization for \(messages.count) messages")
+
+        do {
+            // Get current conversation history
+            let conversationHistory = await getConversationHistory()
+
+            // Create a prompt for context organization
+            let organizationPrompt = createContextOrganizationPrompt(from: conversationHistory)
+
+            // Use the current model to organize the context
+            let organizedSummary = try await requestContextOrganization(prompt: organizationPrompt)
+
+            // Create a new organized message to replace the conversation
+            await replaceConversationWithOrganizedSummary(organizedSummary)
+
+            logger.info("Context organization completed successfully")
+
+        } catch {
+            logger.error("Context organization failed: \(error)")
+
+            // Show error message to user
+            let errorMessage = MessageData(
+                id: UUID(),
+                text: "コンテキスト整理中にエラーが発生しました: \(error.localizedDescription)",
+                user: "System",
+                isError: true,
+                sentTime: Date()
+            )
+            addMessage(errorMessage)
+        }
+
+        await MainActor.run {
+            isContextOrganizationInProgress = false
+        }
+    }
+
+    private func createContextOrganizationPrompt(from history: [BedrockMessage]) -> String {
+        var conversationText = ""
+
+        for message in history {
+            let role = message.role == .user ? "User" : "Assistant"
+
+            for content in message.content {
+                switch content {
+                case .text(let text):
+                    conversationText += "\n\(role): \(text)\n"
+                case .thinking(let thinking):
+                    conversationText += "\n[Assistant Thinking]: \(thinking.text)\n"
+                case .image(_):
+                    conversationText += "\n[Image attached]\n"
+                case .document(let doc):
+                    conversationText += "\n[Document: \(doc.name)]\n"
+                case .tooluse(let tool):
+                    conversationText += "\n[Tool Used: \(tool.name)]\n"
+                case .toolresult(let result):
+                    conversationText += "\n[Tool Result: \(result.result.prefix(100))...]\n"
+                }
+            }
+        }
+
+        return """
+            以下の会話履歴を整理して、重要な情報を保持しながら情報量を削減してください。
+
+            整理の方針：
+            1. 重要な質問と回答は保持する
+            2. 重複する情報は統合する
+            3. 詳細な技術的説明は要点をまとめる
+            4. ツールの使用結果は重要な部分のみ残す
+            5. 会話の流れと文脈は維持する
+
+            会話履歴：
+            \(conversationText)
+
+            上記の会話を整理して、重要な情報を保持しながらより簡潔にまとめてください。
+            整理後の内容は、元の会話の文脈と重要な情報を失わないようにしてください。
+            """
+    }
+
+    private func requestContextOrganization(prompt: String) async throws -> String {
+        // Create a message for the organization request
+        let organizationMessage = BedrockMessage(
+            role: .user,
+            content: [.text(prompt)]
+        )
+
+        // Convert to AWS SDK format
+        let awsMessage = try convertToBedrockMessage(organizationMessage, modelId: chatModel.id)
+
+        // Use the current model for organization
+        var organizedText = ""
+
+        // Use streaming to get the organized content
+        for try await chunk in try await backendModel.backend.converseStream(
+            withId: chatModel.id,
+            messages: [awsMessage],
+            systemContent: [.text("あなたは会話の整理を専門とするアシスタントです。与えられた会話履歴を簡潔にまとめ、重要な情報を保持してください。")],
+            inferenceConfig: nil,
+            usageHandler: { [weak self] usage in
+                let formattedUsage = self?.formatUsageString(usage) ?? ""
+                self?.usageHandler?(formattedUsage)
+            }
+        ) {
+            if let textChunk = extractTextFromChunk(chunk) {
+                organizedText += textChunk
+            }
+        }
+
+        return organizedText.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func replaceConversationWithOrganizedSummary(_ summary: String) async {
+        // Clear current messages
+        await MainActor.run {
+            messages.removeAll()
+        }
+
+        // Create a new summary message
+        let summaryMessage = MessageData(
+            id: UUID(),
+            text: "📋 **会話コンテキストが整理されました**\n\n\(summary)",
+            user: "System",
+            isError: false,
+            sentTime: Date()
+        )
+
+        // Add the summary message
+        addMessage(summaryMessage)
+
+        // Create new conversation history with just the summary
+        let newHistory = [
+            BedrockMessage(
+                role: .assistant,
+                content: [.text(summary)]
+            )
+        ]
+
+        // Save the new organized history
+        await saveConversationHistory(newHistory)
+
+        logger.info("Conversation replaced with organized summary")
+    }
+
+    // MARK: - Context Cache Optimization
+
+    /// Optimizes the conversation context for better cache efficiency
+    func optimizeContextCache() {
+        guard !messages.isEmpty else {
+            logger.info("No messages to optimize for cache")
+            return
+        }
+
+        guard !isContextCacheOptimizationInProgress else {
+            logger.info("Context cache optimization already in progress")
+            return
+        }
+
+        isContextCacheOptimizationInProgress = true
+
+        Task {
+            await performContextCacheOptimization()
+        }
+    }
+
+    private func performContextCacheOptimization() async {
+        logger.info("Starting context cache optimization for \(messages.count) messages")
+
+        do {
+            // Get current conversation history
+            let conversationHistory = await getConversationHistory()
+
+            // Analyze and optimize the conversation for cache efficiency
+            let optimizedHistory = await optimizeHistoryForCache(conversationHistory)
+
+            // Update the conversation with optimized content
+            await updateConversationWithOptimizedHistory(optimizedHistory)
+
+            logger.info("Context cache optimization completed successfully")
+
+        } catch {
+            logger.error("Context cache optimization failed: \(error)")
+
+            // Show error message to user
+            let errorMessage = MessageData(
+                id: UUID(),
+                text: "コンテキストキャッシュ最適化中にエラーが発生しました: \(error.localizedDescription)",
+                user: "System",
+                isError: true,
+                sentTime: Date()
+            )
+            addMessage(errorMessage)
+        }
+
+        await MainActor.run {
+            isContextCacheOptimizationInProgress = false
+        }
+    }
+
+    private func optimizeHistoryForCache(_ history: [BedrockMessage]) async -> [BedrockMessage] {
+        logger.info("Optimizing \(history.count) messages for cache efficiency")
+
+        // Calculate token usage and determine optimal message count for 200K context window
+        let targetTokenLimit = 180_000  // Leave 20K tokens for new conversation
+        let (recentMessageCount, estimatedTokens) = calculateOptimalMessageCount(
+            history, targetLimit: targetTokenLimit)
+
+        logger.info(
+            "Calculated optimal message count: \(recentMessageCount) (estimated tokens: \(estimatedTokens))"
+        )
+
+        let recentMessages = Array(history.suffix(recentMessageCount))
+        let olderMessages = Array(history.prefix(history.count - recentMessageCount))
+
+        var optimizedHistory: [BedrockMessage] = []
+
+        // If there are older messages, create a summary
+        if !olderMessages.isEmpty {
+            do {
+                let compressedSummary = try await compressMessagesForCache(olderMessages)
+
+                // Create a single compressed message
+                let compressedMessage = BedrockMessage(
+                    role: .assistant,
+                    content: [.text("📋 **前の会話の要約**: \(compressedSummary)")]
+                )
+                optimizedHistory.append(compressedMessage)
+
+                logger.info("Compressed \(olderMessages.count) older messages into summary")
+            } catch {
+                logger.error("Failed to compress older messages: \(error)")
+                // If compression fails, create a simple placeholder
+                let placeholderMessage = BedrockMessage(
+                    role: .assistant,
+                    content: [.text("📋 **前の会話**: 以前の会話履歴（\(olderMessages.count)メッセージ）が圧縮されました。")]
+                )
+                optimizedHistory.append(placeholderMessage)
+            }
+        }
+
+        // Add recent messages with smart filtering
+        for message in recentMessages {
+            var filteredContent: [MessageContent] = []
+
+            for content in message.content {
+                switch content {
+                case .text(let text):
+                    // Keep full text for recent messages but limit extremely long texts
+                    let truncatedText =
+                        text.count > 10000 ? String(text.prefix(10000)) + "..." : text
+                    filteredContent.append(.text(truncatedText))
+                case .thinking(let thinking):
+                    // Keep thinking for Claude models but limit length
+                    if !isOpenAIModel(chatModel.id) && !isDeepSeekModel(chatModel.id) {
+                        let truncatedThinking =
+                            thinking.text.count > 5000
+                            ? String(thinking.text.prefix(5000)) + "..." : thinking.text
+                        filteredContent.append(
+                            .thinking(
+                                MessageContent.ThinkingContent(
+                                    text: truncatedThinking, signature: thinking.signature)))
+                    }
+                case .image(_):
+                    // Replace images with placeholder to save tokens
+                    filteredContent.append(.text("[画像が添付されていました]"))
+                case .document(let doc):
+                    // Replace documents with name reference
+                    filteredContent.append(.text("[ドキュメント: \(doc.name)]"))
+                case .tooluse(let tool):
+                    // Keep tool use but simplify input
+                    let simplifiedInput = simplifyToolInput(tool.input)
+                    filteredContent.append(
+                        .tooluse(
+                            MessageContent.ToolUseContent(
+                                toolUseId: tool.toolUseId,
+                                name: tool.name,
+                                input: simplifiedInput
+                            )))
+                case .toolresult(let result):
+                    // Keep tool results but limit length
+                    let truncatedResult =
+                        result.result.count > 2000
+                        ? String(result.result.prefix(2000)) + "..." : result.result
+                    filteredContent.append(
+                        .toolresult(
+                            MessageContent.ToolResultContent(
+                                toolUseId: result.toolUseId,
+                                result: truncatedResult,
+                                status: result.status
+                            )))
+                }
+            }
+
+            if !filteredContent.isEmpty {
+                let filteredMessage = BedrockMessage(role: message.role, content: filteredContent)
+                optimizedHistory.append(filteredMessage)
+            }
+        }
+
+        logger.info("Optimized history: \(optimizedHistory.count) messages (was \(history.count))")
+        return optimizedHistory
+    }
+
+    private func compressMessagesForCache(_ messages: [BedrockMessage]) async throws -> String {
+        var conversationText = ""
+
+        for message in messages {
+            let role = message.role == .user ? "User" : "Assistant"
+
+            for content in message.content {
+                switch content {
+                case .text(let text):
+                    conversationText += "\n\(role): \(text)\n"
+                case .thinking(let thinking):
+                    // Include key insights from thinking
+                    conversationText += "\n[Key Insight]: \(thinking.text.prefix(200))...\n"
+                case .image(_):
+                    conversationText += "\n[Image discussed]\n"
+                case .document(let doc):
+                    conversationText += "\n[Document analyzed: \(doc.name)]\n"
+                case .tooluse(let tool):
+                    conversationText += "\n[Tool used: \(tool.name)]\n"
+                case .toolresult(let result):
+                    // Include key results
+                    conversationText += "\n[Result: \(result.result.prefix(150))...]\n"
+                }
+            }
+        }
+
+        let compressionPrompt = """
+            以下の会話履歴をキャッシュ効率を考慮して圧縮してください。
+
+            圧縮の方針：
+            1. 重要な情報と文脈は保持する
+            2. 冗長な表現を削除する
+            3. キーポイントを箇条書きで整理する
+            4. 技術的な詳細は要約する
+            5. 会話の流れは簡潔に保つ
+
+            会話履歴：
+            \(conversationText)
+
+            上記の内容を、重要な情報を失わずにキャッシュ効率の良い形で圧縮してください。
+            """
+
+        // Create a message for the compression request
+        let compressionMessage = BedrockMessage(
+            role: .user,
+            content: [.text(compressionPrompt)]
+        )
+
+        // Convert to AWS SDK format
+        let awsMessage = try convertToBedrockMessage(compressionMessage, modelId: chatModel.id)
+
+        // Use a lightweight model for compression to save costs
+        let compressionModelId = "us.amazon.nova-lite-v1:0"  // Use Nova Lite for efficiency
+
+        var compressedText = ""
+
+        // Use streaming to get the compressed content
+        for try await chunk in try await backendModel.backend.converseStream(
+            withId: compressionModelId,
+            messages: [awsMessage],
+            systemContent: [
+                .text("あなたは効率的なコンテキスト圧縮の専門家です。重要な情報を保持しながら、キャッシュ効率を最大化する形で内容を圧縮してください。")
+            ],
+            inferenceConfig: nil,
+            usageHandler: { [weak self] usage in
+                let formattedUsage = self?.formatUsageString(usage) ?? ""
+                self?.usageHandler?(formattedUsage)
+            }
+        ) {
+            if let textChunk = extractTextFromChunk(chunk) {
+                compressedText += textChunk
+            }
+        }
+
+        return compressedText.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    // MARK: - Token Calculation Helpers
+
+    /// Calculates optimal message count based on target token limit
+    private func calculateOptimalMessageCount(_ history: [BedrockMessage], targetLimit: Int) -> (
+        messageCount: Int, estimatedTokens: Int
+    ) {
+        var totalTokens = 0
+        var messageCount = 0
+
+        // Process messages from newest to oldest
+        for message in history.reversed() {
+            let messageTokens = estimateTokensForMessage(message)
+
+            if totalTokens + messageTokens <= targetLimit {
+                totalTokens += messageTokens
+                messageCount += 1
+            } else {
+                break
+            }
+        }
+
+        // Ensure we keep at least 1 message if history is not empty
+        if messageCount == 0 && !history.isEmpty {
+            messageCount = 1
+            totalTokens = estimateTokensForMessage(history.last!)
+        }
+
+        return (messageCount, totalTokens)
+    }
+
+    /// Estimates token count for a single message
+    private func estimateTokensForMessage(_ message: BedrockMessage) -> Int {
+        var tokens = 0
+
+        for content in message.content {
+            switch content {
+            case .text(let text):
+                // Rough estimation: 1 token per 4 characters for English/Japanese mixed text
+                tokens += max(1, text.count / 3)
+            case .thinking(let thinking):
+                // Thinking content uses more tokens due to XML structure
+                tokens += max(1, thinking.text.count / 3) + 50  // XML overhead
+            case .image(_):
+                // Images use significant tokens (Claude 3.5 uses ~1600 tokens per image)
+                tokens += 1600
+            case .document(let doc):
+                // Documents vary greatly, estimate based on name and assume moderate content
+                tokens += 500 + (doc.name.count / 4)
+            case .tooluse(let tool):
+                // Tool use has JSON structure overhead
+                let inputTokens = estimateTokensForJSONValue(tool.input)
+                tokens += 100 + inputTokens  // Base overhead + input
+            case .toolresult(let result):
+                // Tool results can be lengthy
+                tokens += max(50, result.result.count / 3) + 50  // Content + XML overhead
+            }
+        }
+
+        // Add base message overhead (role, structure, etc.)
+        tokens += 20
+
+        return tokens
+    }
+
+    /// Estimates tokens for JSONValue content
+    private func estimateTokensForJSONValue(_ jsonValue: JSONValue) -> Int {
+        switch jsonValue {
+        case .null:
+            return 1
+        case .bool(_):
+            return 1
+        case .number(_):
+            return 1
+        case .string(let str):
+            return max(1, str.count / 4)
+        case .array(let arr):
+            return arr.reduce(10) { total, item in  // 10 for array structure
+                total + estimateTokensForJSONValue(item)
+            }
+        case .object(let obj):
+            return obj.reduce(10) { total, pair in  // 10 for object structure
+                let keyTokens = pair.key.count / 4
+                let valueTokens = estimateTokensForJSONValue(pair.value)
+                return total + keyTokens + valueTokens
+            }
+        }
+    }
+
+    /// Simplifies tool input to reduce token usage
+    private func simplifyToolInput(_ input: JSONValue) -> JSONValue {
+        switch input {
+        case .string(let str):
+            // Truncate long strings
+            if str.count > 200 {
+                return .string(String(str.prefix(200)) + "...")
+            }
+            return input
+        case .array(let arr):
+            // Limit array size and simplify elements
+            let simplified = Array(arr.prefix(5)).map { simplifyToolInput($0) }
+            return .array(simplified)
+        case .object(let obj):
+            // Keep only essential keys and simplify values
+            var simplified: [String: JSONValue] = [:]
+            let essentialKeys = Array(obj.keys.prefix(5))  // Keep first 5 keys
+            for key in essentialKeys {
+                if let value = obj[key] {
+                    simplified[key] = simplifyToolInput(value)
+                }
+            }
+            return .object(simplified)
+        default:
+            return input
+        }
+    }
+
+    private func updateConversationWithOptimizedHistory(_ optimizedHistory: [BedrockMessage]) async
+    {
+        // Update UI messages
+        await MainActor.run {
+            messages.removeAll()
+        }
+
+        // Convert optimized history back to UI messages
+        for bedrockMessage in optimizedHistory {
+            let role = bedrockMessage.role == .user ? "User" : chatModel.name
+            var text = ""
+            var thinking: String? = nil
+            var signature: String? = nil
+
+            for content in bedrockMessage.content {
+                switch content {
+                case .text(let txt):
+                    text += txt
+                case .thinking(let tc):
+                    thinking = (thinking ?? "") + tc.text
+                    if signature == nil {
+                        signature = tc.signature
+                    }
+                default:
+                    break
+                }
+            }
+
+            let messageData = MessageData(
+                id: UUID(),
+                text: text,
+                thinking: thinking,
+                signature: signature,
+                user: role,
+                isError: false,
+                sentTime: Date()
+            )
+
+            addMessage(messageData)
+        }
+
+        // Save the optimized history
+        await saveConversationHistory(optimizedHistory)
+
+        logger.info("Conversation updated with optimized cache-friendly history")
+    }
+
     // MARK: - Edit/Delete Message Handlers
 
     private func handleEditMessage(messageId: UUID, messageText: String, isUserMessage: Bool) {
@@ -2287,12 +2935,18 @@ class ChatViewModel: ObservableObject {
 
         logger.info("Deleting \(messages.count - messageIndex) messages from index \(messageIndex)")
 
-        // UI上のメッセージを削除
+        // 即座にUIから削除してユーザーフィードバックを提供
+        let messagesToDelete = Array(messages.suffix(from: messageIndex))
         messages.removeSubrange(messageIndex...)
 
-        // 会話履歴からも削除
+        // 削除されたメッセージのIDをログ出力
+        let deletedIds = messagesToDelete.map { $0.id }
+        logger.info("Deleted message IDs: \(deletedIds)")
+
+        // バックグラウンドで履歴とストレージから削除
         Task {
-            await deleteMessagesFromHistory(fromMessageId: messageId)
+            await deleteMessagesFromStorageAndHistory(
+                messageIndex: messageIndex, messageId: messageId)
         }
     }
 
@@ -2307,20 +2961,15 @@ class ChatViewModel: ObservableObject {
         if isEditingUserMessage {
             // ユーザーメッセージの編集：該当メッセージ以降を削除して再投稿
 
-            // まず該当メッセージ以降を削除
-            handleDeleteMessage(messageId: messageId, isUserMessage: true)
-
-            // 編集されたテキストを新しいユーザー入力として設定
-            userInput = editingMessageText
-
-            // 編集ダイアログを閉じる
+            // 編集ダイアログを先に閉じる
             isEditDialogVisible = false
             editingMessageId = nil
+            let editedText = editingMessageText
             editingMessageText = ""
 
-            // 少し遅延を入れてからメッセージを再送信（削除処理完了を待つ）
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                self.sendMessage()
+            // 該当メッセージ以降を削除し、会話履歴の整合性を確保してから再送信
+            Task {
+                await cleanDeleteAndResend(messageId: messageId, newText: editedText)
             }
         } else {
             // アシスタントメッセージの編集：テキストのみ更新
@@ -2358,39 +3007,449 @@ class ChatViewModel: ObservableObject {
         editingMessageText = ""
     }
 
-    private func deleteMessagesFromHistory(fromMessageId: UUID) async {
-        logger.info("Deleting messages from history starting from ID: \(fromMessageId)")
+    // MARK: - Clean Delete and Resend
+
+    /// Clean delete and resend mechanism to maintain conversation history integrity
+    private func cleanDeleteAndResend(messageId: UUID, newText: String) async {
+        logger.info("Starting clean delete and resend for message ID: \(messageId)")
+
+        // Find the message index
+        guard let messageIndex = messages.firstIndex(where: { $0.id == messageId }) else {
+            logger.warning("Message with ID \(messageId) not found for clean delete")
+            return
+        }
+
+        logger.info(
+            "Found message at index \(messageIndex), will delete \(messages.count - messageIndex) messages"
+        )
+
+        // Get conversation history before deletion
+        guard let history = chatManager.getConversationHistory(for: chatId) else {
+            logger.warning("No conversation history found for clean delete")
+            // Fallback to simple deletion and resend
+            await fallbackDeleteAndResend(messageIndex: messageIndex, newText: newText)
+            return
+        }
+
+        // NEW: Aggressive tool cleanup approach to prevent ValidationException
+        // If ValidationException persists, clean all tool-related messages completely
+        let shouldUseAggressiveCleanup = await shouldUseAggressiveToolCleanup(history: history)
+
+        if shouldUseAggressiveCleanup {
+            logger.info("🔧 Using aggressive tool cleanup to prevent ValidationException")
+            await aggressiveToolCleanupAndResend(
+                messageIndex: messageIndex, newText: newText, history: history)
+            return
+        }
+
+        // Original approach with tool pair analysis
+        let (cleanHistoryIndex, brokenToolPairs) = await analyzeToolPairIntegrity(
+            history: history,
+            uiMessageIndex: messageIndex
+        )
+
+        logger.info(
+            "Clean deletion will remove from history index \(cleanHistoryIndex), broken tool pairs: \(brokenToolPairs.count)"
+        )
+
+        // Remove messages from UI immediately for responsiveness
+        messages.removeSubrange(messageIndex...)
+
+        // Clean delete from conversation history maintaining tool_use/tool_result integrity
+        await cleanDeleteFromHistory(
+            history: history,
+            fromIndex: cleanHistoryIndex,
+            brokenToolPairs: brokenToolPairs
+        )
+
+        // Clean delete from storage
+        let _ = await chatManager.deleteMessagesFromIndex(messageIndex, for: chatId)
+
+        // Set the new text and resend
+        await MainActor.run {
+            self.userInput = newText
+        }
+
+        // Small delay to ensure cleanup is complete
+        try? await Task.sleep(nanoseconds: 100_000_000)  // 0.1 second
+
+        // Resend the message
+        await MainActor.run {
+            self.sendMessage()
+        }
+
+        logger.info("Clean delete and resend completed successfully")
+    }
+
+    /// Analyzes conversation history to identify tool pairs that would be broken by deletion
+    private func analyzeToolPairIntegrity(
+        history: ConversationHistory,
+        uiMessageIndex: Int
+    ) async -> (cleanHistoryIndex: Int, brokenToolPairs: Set<String>) {
+
+        // Map UI message index to conversation history index
+        let historyIndex = min(uiMessageIndex, history.messages.count - 1)
+
+        var brokenToolPairs: Set<String> = []
+        var cleanHistoryIndex = historyIndex
+
+        // Look for tool_use messages in the deletion range that need their tool_result partners removed too
+        for i in historyIndex..<history.messages.count {
+            let message = history.messages[i]
+
+            if message.role == .assistant, let toolUse = message.toolUse {
+                // This assistant message has tool_use, we need to also remove any corresponding tool_result
+                brokenToolPairs.insert(toolUse.toolId)
+                logger.debug(
+                    "Found tool_use ID \(toolUse.toolId) in deletion range, marking for cleanup")
+            }
+
+            if message.role == .user, let toolUse = message.toolUse, toolUse.result != nil {
+                // This user message has tool_result, we need to also remove any corresponding tool_use
+                brokenToolPairs.insert(toolUse.toolId)
+                logger.debug(
+                    "Found tool_result ID \(toolUse.toolId) in deletion range, marking for cleanup")
+            }
+        }
+
+        // If we have broken tool pairs, we need to clean backwards to remove orphaned partners
+        if !brokenToolPairs.isEmpty {
+            // Scan backwards from the deletion point to find and include orphaned tool partners
+            for i in stride(from: historyIndex - 1, through: 0, by: -1) {
+                let message = history.messages[i]
+                var shouldIncludeInDeletion = false
+
+                if message.role == .assistant, let toolUse = message.toolUse {
+                    // Assistant message with tool_use - check if its partner will be deleted
+                    if brokenToolPairs.contains(toolUse.toolId) {
+                        shouldIncludeInDeletion = true
+                        logger.debug(
+                            "Including assistant tool_use message at index \(i) for tool ID \(toolUse.toolId)"
+                        )
+                    }
+                }
+
+                if message.role == .user, let toolUse = message.toolUse, toolUse.result != nil {
+                    // User message with tool_result - check if its partner will be deleted
+                    if brokenToolPairs.contains(toolUse.toolId) {
+                        shouldIncludeInDeletion = true
+                        logger.debug(
+                            "Including user tool_result message at index \(i) for tool ID \(toolUse.toolId)"
+                        )
+                    }
+                }
+
+                if shouldIncludeInDeletion {
+                    cleanHistoryIndex = i
+                } else {
+                    // If this message doesn't need to be included, stop scanning backwards
+                    break
+                }
+            }
+        }
+
+        return (cleanHistoryIndex, brokenToolPairs)
+    }
+
+    /// Performs clean deletion from conversation history maintaining tool_use/tool_result integrity
+    private func cleanDeleteFromHistory(
+        history: ConversationHistory,
+        fromIndex: Int,
+        brokenToolPairs: Set<String>
+    ) async {
+
+        var updatedHistory = history
+
+        if fromIndex < updatedHistory.messages.count && fromIndex >= 0 {
+            let messagesToDelete = updatedHistory.messages.count - fromIndex
+
+            // Log what we're about to delete
+            logger.info(
+                "Clean deleting \(messagesToDelete) messages from history starting at index \(fromIndex)"
+            )
+
+            for i in fromIndex..<updatedHistory.messages.count {
+                let message = updatedHistory.messages[i]
+                if let toolUse = message.toolUse {
+                    logger.debug("Deleting message with tool ID: \(toolUse.toolId)")
+                }
+            }
+
+            // Perform the deletion
+            updatedHistory.messages.removeSubrange(fromIndex...)
+
+            // Verify we didn't leave any orphaned tool_use or tool_result
+            await validateHistoryIntegrity(updatedHistory)
+
+            // Save the cleaned history
+            chatManager.saveConversationHistory(updatedHistory, for: chatId)
+
+            logger.info(
+                "Clean deletion completed. Remaining messages: \(updatedHistory.messages.count)")
+        } else {
+            logger.warning("Invalid clean deletion index: \(fromIndex)")
+        }
+    }
+
+    /// Validates that conversation history doesn't have orphaned tool_use or tool_result messages
+    private func validateHistoryIntegrity(_ history: ConversationHistory) async {
+        var toolUseIds: Set<String> = []
+        var toolResultIds: Set<String> = []
+        var orphanedTools: [String] = []
+
+        for message in history.messages {
+            if let toolUse = message.toolUse {
+                if message.role == .assistant {
+                    // Assistant message with tool_use
+                    toolUseIds.insert(toolUse.toolId)
+                } else if message.role == .user && toolUse.result != nil {
+                    // User message with tool_result
+                    toolResultIds.insert(toolUse.toolId)
+                }
+            }
+        }
+
+        // Find orphaned tool_use (no corresponding tool_result)
+        for toolId in toolUseIds {
+            if !toolResultIds.contains(toolId) {
+                orphanedTools.append("tool_use:\(toolId)")
+            }
+        }
+
+        // Find orphaned tool_result (no corresponding tool_use)
+        for toolId in toolResultIds {
+            if !toolUseIds.contains(toolId) {
+                orphanedTools.append("tool_result:\(toolId)")
+            }
+        }
+
+        if !orphanedTools.isEmpty {
+            logger.warning(
+                "⚠️ History integrity check found orphaned tools: \(orphanedTools.joined(separator: ", "))"
+            )
+            // In a production app, you might want to clean these up automatically
+        } else {
+            logger.info("✅ History integrity check passed - no orphaned tool pairs")
+        }
+    }
+
+    /// Determines whether to use aggressive tool cleanup based on history analysis
+    private func shouldUseAggressiveToolCleanup(history: ConversationHistory) async -> Bool {
+        // Count tool-related messages in the history
+        var toolUseCount = 0
+        var toolResultCount = 0
+        var toolIdsUsed: Set<String> = []
+        var toolIdsCompleted: Set<String> = []
+
+        for message in history.messages {
+            if let toolUse = message.toolUse {
+                if message.role == .assistant {
+                    // Assistant message with tool_use
+                    toolUseCount += 1
+                    toolIdsUsed.insert(toolUse.toolId)
+                } else if message.role == .user && toolUse.result != nil {
+                    // User message with tool_result
+                    toolResultCount += 1
+                    toolIdsCompleted.insert(toolUse.toolId)
+                }
+            }
+        }
+
+        // Use aggressive cleanup if:
+        // 1. There are tool-related messages present
+        // 2. There are unmatched tool pairs (more tool_use than tool_result, or vice versa)
+        // 3. There are tool IDs that don't have complete pairs
+
+        let hasToolMessages = toolUseCount > 0 || toolResultCount > 0
+        let hasMismatchedCounts = toolUseCount != toolResultCount
+        let hasOrphanedToolIds =
+            !toolIdsUsed.isSubset(of: toolIdsCompleted)
+            || !toolIdsCompleted.isSubset(of: toolIdsUsed)
+
+        let shouldUseAggressive = hasToolMessages && (hasMismatchedCounts || hasOrphanedToolIds)
+
+        if shouldUseAggressive {
+            logger.info(
+                "🔧 Aggressive cleanup triggered: toolUse=\(toolUseCount), toolResult=\(toolResultCount), orphaned=\(hasOrphanedToolIds)"
+            )
+        }
+
+        return shouldUseAggressive
+    }
+
+    /// Aggressive tool cleanup that removes all tool-related messages to prevent ValidationException
+    private func aggressiveToolCleanupAndResend(
+        messageIndex: Int, newText: String, history: ConversationHistory
+    ) async {
+        logger.info("🔧 Starting aggressive tool cleanup for \(history.messages.count) messages")
+
+        // Strategy: Create a completely clean conversation history with only text messages
+        // This ensures no orphaned tool_use/tool_result pairs can cause ValidationException
+
+        var cleanHistory = ConversationHistory(chatId: chatId, modelId: chatModel.id)
+
+        // Process messages up to the edit point, removing all tool-related content
+        let processingLimit = min(messageIndex, history.messages.count)
+
+        for i in 0..<processingLimit {
+            let message = history.messages[i]
+
+            // Create a clean message with only text content, no tool information
+            let cleanMessage = Message(
+                id: UUID(),
+                text: message.text,
+                role: message.role,
+                timestamp: message.timestamp,
+                isError: message.isError,
+                thinking: message.thinking,
+                thinkingSignature: message.thinkingSignature,
+                imageBase64Strings: message.imageBase64Strings,
+                documentBase64Strings: message.documentBase64Strings,
+                documentFormats: message.documentFormats,
+                documentNames: message.documentNames,
+                toolUse: nil  // Remove all tool usage information
+            )
+
+            // Only add messages with meaningful content
+            if !message.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                || message.imageBase64Strings?.isEmpty == false
+                || message.documentBase64Strings?.isEmpty == false
+            {
+                cleanHistory.addMessage(cleanMessage)
+            }
+        }
+
+        logger.info(
+            "🔧 Created clean history with \(cleanHistory.messages.count) messages (was \(history.messages.count))"
+        )
+
+        // Update UI messages to match clean history
+        await MainActor.run {
+            self.messages.removeAll()
+
+            // Convert clean history back to UI messages
+            for message in cleanHistory.messages {
+                let role = message.role == .user ? "User" : self.chatModel.name
+
+                let messageData = MessageData(
+                    id: message.id,
+                    text: message.text,
+                    thinking: message.thinking,
+                    signature: message.thinkingSignature,
+                    user: role,
+                    isError: message.isError,
+                    sentTime: message.timestamp,
+                    imageBase64Strings: message.imageBase64Strings,
+                    documentBase64Strings: message.documentBase64Strings,
+                    documentFormats: message.documentFormats,
+                    documentNames: message.documentNames
+                        // Note: No toolUse or toolResult - completely clean
+                )
+
+                self.messages.append(messageData)
+            }
+        }
+
+        // Save the clean history
+        chatManager.saveConversationHistory(cleanHistory, for: chatId)
+
+        // Clean delete from storage as well
+        let _ = await chatManager.deleteMessagesFromIndex(
+            max(0, cleanHistory.messages.count), for: chatId)
+
+        // Set the new text and resend
+        await MainActor.run {
+            self.userInput = newText
+        }
+
+        // Small delay to ensure cleanup is complete
+        try? await Task.sleep(nanoseconds: 200_000_000)  // 0.2 second (longer for aggressive cleanup)
+
+        // Resend the message
+        await MainActor.run {
+            self.sendMessage()
+        }
+
+        logger.info("🔧 Aggressive tool cleanup and resend completed successfully")
+    }
+
+    /// Fallback method for simple deletion and resend when conversation history is not available
+    private func fallbackDeleteAndResend(messageIndex: Int, newText: String) async {
+        logger.info("Using fallback delete and resend method")
+
+        // Simple deletion from storage
+        let _ = await chatManager.deleteMessagesFromIndex(messageIndex, for: chatId)
+
+        // Set the new text and resend
+        await MainActor.run {
+            self.userInput = newText
+        }
+
+        // Small delay
+        try? await Task.sleep(nanoseconds: 100_000_000)  // 0.1 second
+
+        // Resend the message
+        await MainActor.run {
+            self.sendMessage()
+        }
+    }
+
+    // MARK: - Storage Reload Methods
+
+    /// ストレージからメッセージを再読み込みしてUIを更新
+    private func reloadMessagesFromStorage() {
+        logger.info("Reloading messages from storage for chat: \(chatId)")
+
+        // ChatManagerから最新のメッセージを取得
+        let reloadedMessages = chatManager.getMessages(for: chatId)
+
+        // UIを更新
+        messages = reloadedMessages
+
+        logger.info("Reloaded \(reloadedMessages.count) messages from storage")
+    }
+
+    /// ストレージと履歴から指定されたメッセージ以降を削除する統合メソッド
+    private func deleteMessagesFromStorageAndHistory(messageIndex: Int, messageId: UUID) async {
+        logger.info(
+            "Deleting messages from storage and history starting from index: \(messageIndex)")
+
+        // ChatManagerから指定インデックス以降のメッセージを削除
+        let deletedCount = await chatManager.deleteMessagesFromIndex(messageIndex, for: chatId)
+        logger.info("Deleted \(deletedCount) messages from ChatManager storage")
+
+        // 会話履歴からも削除
+        await deleteMessagesFromHistory(startingFromIndex: messageIndex)
+
+        logger.info("Successfully completed storage and history cleanup")
+    }
+
+    private func deleteMessagesFromHistory(startingFromIndex index: Int) async {
+        logger.info("Deleting messages from history starting from index: \(index)")
 
         guard let history = chatManager.getConversationHistory(for: chatId) else {
             logger.warning("No conversation history found for chat \(chatId)")
             return
         }
 
-        // 指定されたメッセージのインデックスを見つける
-        // MessageDataのIDと履歴のMessage IDを対応させる必要がある
-        // まず、UI上のメッセージインデックスを取得
-        guard let uiMessageIndex = messages.firstIndex(where: { $0.id == fromMessageId }) else {
-            logger.warning("Message with ID \(fromMessageId) not found in UI messages")
-            return
-        }
+        // 指定されたインデックス以降の履歴を削除
+        let historyIndexToDelete = min(index, history.messages.count - 1)
 
-        // UI上のメッセージインデックスに対応する履歴のインデックスを計算
-        // 通常、UI上のメッセージと履歴のメッセージは1:1対応しているが、
-        // ツール使用などで複数の履歴エントリが1つのUIメッセージに対応する場合がある
-
-        // 安全のため、UI上のメッセージインデックス以降の履歴を削除
-        let historyIndexToDelete = min(uiMessageIndex, history.messages.count - 1)
-
-        if historyIndexToDelete < history.messages.count {
+        if historyIndexToDelete < history.messages.count && historyIndexToDelete >= 0 {
             var updatedHistory = history
             let messagesToDelete = updatedHistory.messages.count - historyIndexToDelete
+
+            // 削除前のカウントをログ出力
+            logger.info("History before deletion: \(updatedHistory.messages.count) messages")
+
+            // 指定インデックス以降を削除
             updatedHistory.messages.removeSubrange(historyIndexToDelete...)
 
             // 更新された履歴を保存
             chatManager.saveConversationHistory(updatedHistory, for: chatId)
 
             logger.info(
-                "Deleted \(messagesToDelete) messages from history starting at index \(historyIndexToDelete)"
+                "Deleted \(messagesToDelete) messages from history. Remaining: \(updatedHistory.messages.count) messages"
             )
         } else {
             logger.warning("Invalid history index for deletion: \(historyIndexToDelete)")
