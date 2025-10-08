@@ -5,15 +5,13 @@
 //  Created by Na, Sanghwa on 2023/10/06.
 //
 
-import SwiftUI
 import Combine
-import UniformTypeIdentifiers
 import Logging
+import SwiftUI
+import UniformTypeIdentifiers
 
-/**
- * Main message input bar view with image attachment handling.
- * Supports text input, image pasting/uploading, and various interaction modes.
- */
+/// Main message input bar view with image attachment handling.
+/// Supports text input, image pasting/uploading, and various interaction modes.
 struct MessageBarView: View {
     // MARK: - Properties
     var chatID: String
@@ -22,7 +20,7 @@ struct MessageBarView: View {
     @ObservedObject var chatManager: ChatManager = ChatManager.shared
     @StateObject var sharedMediaDataSource: SharedMediaDataSource
     var transcribeManager: TranscribeStreamingManager
-    
+
     // UI state tracking
     @State private var calculatedHeight: CGFloat = 40
     @State private var isImagePickerPresented: Bool = false
@@ -33,19 +31,19 @@ struct MessageBarView: View {
     @FocusState private var isInputFocused: Bool
     @State private var attachments: [ImageAttachment] = []
     @State private var documentAttachments: [DocumentAttachment] = []
-    
+
     // Action handlers
     var sendMessage: () async -> Void
     var cancelSending: () -> Void
     var modelId: String
-    
+
     var logger = Logger(label: "MessageBarView")
-    
+
     // MARK: - Body
     var body: some View {
         VStack(spacing: 0) {
             // Attachment list (when images or documents are present)
-            if (!sharedMediaDataSource.images.isEmpty || !sharedMediaDataSource.documents.isEmpty) {
+            if !sharedMediaDataSource.images.isEmpty || !sharedMediaDataSource.documents.isEmpty {
                 AttachmentListView(
                     attachments: $attachments,
                     documentAttachments: $documentAttachments,
@@ -58,13 +56,13 @@ struct MessageBarView: View {
                 )
                 .transition(.opacity)
             }
-            
+
             // Message input bar with buttons
             HStack(alignment: .center, spacing: 2) {
                 fileUploadButton
                 advancedOptionsButton
                 inputArea
-                
+
                 HStack(spacing: 4) {
                     micButton
                     sendButton
@@ -83,7 +81,7 @@ struct MessageBarView: View {
             )
             .padding(.horizontal, 24)
             .padding(.vertical, 8)
-            
+
             // Loading indicator
             if isPasting {
                 PasteLoadingView()
@@ -95,14 +93,17 @@ struct MessageBarView: View {
         .onExitCommand {
             if isLoading { cancelSending() }
         }
-        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+        .onReceive(
+            NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)
+        ) { _ in
             DispatchQueue.main.async {
                 isInputFocused = true
             }
         }
         .sheet(isPresented: $showImagePreview) {
             if let index = selectedImageIndex,
-               index < sharedMediaDataSource.images.count {
+                index < sharedMediaDataSource.images.count
+            {
                 ImagePreviewModal(
                     image: sharedMediaDataSource.images[index],
                     filename: getFileName(for: index),
@@ -117,9 +118,9 @@ struct MessageBarView: View {
             syncAttachments()
         }
     }
-    
+
     // MARK: - UI Components
-    
+
     private var advancedOptionsButton: some View {
         AdvancedOptionsMenu(
             userInput: $userInput,
@@ -127,14 +128,16 @@ struct MessageBarView: View {
             modelId: modelId
         )
     }
-    
+
     private var fileUploadButton: some View {
         Button(action: {
             let panel = NSOpenPanel()
-            panel.allowedFileTypes = ["pdf", "csv", "doc", "docx", "xls", "xlsx", "html", "txt", "md",
-                                       "jpg", "jpeg", "png", "gif", "tiff", "webp"]
+            panel.allowedFileTypes = [
+                "pdf", "csv", "doc", "docx", "xls", "xlsx", "html", "txt", "md",
+                "jpg", "jpeg", "png", "gif", "tiff", "webp",
+            ]
             panel.allowsMultipleSelection = true
-            
+
             panel.begin { response in
                 if response == .OK {
                     handleFileImport(panel.urls)
@@ -148,7 +151,7 @@ struct MessageBarView: View {
         .buttonStyle(PlainButtonStyle())
         .frame(width: 32, height: 32)
     }
-    
+
     private var micButton: some View {
         Button(action: {
             Task {
@@ -170,7 +173,7 @@ struct MessageBarView: View {
         // Explicitly prevent it from getting keyboard focus
         .accessibilityAddTraits(.isButton)
     }
-    
+
     private var inputArea: some View {
         FirstResponderTextView(
             text: $userInput,
@@ -197,7 +200,7 @@ struct MessageBarView: View {
             setupTranscriptObserver()
         }
     }
-    
+
     private var sendButton: some View {
         Button(action: {
             if isLoading {
@@ -218,39 +221,66 @@ struct MessageBarView: View {
         }
         .buttonStyle(PlainButtonStyle())
         .disabled(userInput.isEmpty && sharedMediaDataSource.images.isEmpty && !isLoading)
-        .opacity((userInput.isEmpty && sharedMediaDataSource.images.isEmpty && !isLoading) ? 0.6 : 1)
+        .opacity(
+            (userInput.isEmpty && sharedMediaDataSource.images.isEmpty && !isLoading) ? 0.6 : 1
+        )
         .onChange(of: chatManager.getIsLoading(for: chatID)) { isLoading = $0 }
     }
-    
+
     // MARK: - Helper Methods
-    
+
+    // NEW: Track if send is in progress to prevent duplicate calls
+    @State private var isSendingInProgress = false
+
     private func handleSendMessage() {
+        // Prevent duplicate sends - this is the root cause fix
+        guard !isSendingInProgress else {
+            logger.warning("⚠️ handleSendMessage blocked: Already in progress")
+            return
+        }
+
+        // Prevent sending while loading
+        guard !isLoading else {
+            logger.warning("⚠️ handleSendMessage blocked: Currently loading")
+            return
+        }
+
+        // Set flag immediately (synchronous)
+        isSendingInProgress = true
+
         Task {
+            defer {
+                // Always reset flag when done
+                isSendingInProgress = false
+            }
+
             await sendMessage()
             transcribeManager.resetTranscript()
         }
     }
-    
+
     private func setupEscapeKeyHandler() {
         // Create a monitor for local key down events
         NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
-            if event.keyCode == 53 && self.isLoading { // ESC key
+            if event.keyCode == 53 && self.isLoading {  // ESC key
                 DispatchQueue.main.async {
                     self.cancelSending()
                 }
-                return nil // Consume the event
+                return nil  // Consume the event
             }
-            return event // Pass other events through
+            return event  // Pass other events through
         }
     }
-    
+
     private func handleFileImport(_ urls: [URL]) {
-        let maxToAdd = min(10 - (sharedMediaDataSource.images.count + sharedMediaDataSource.documents.count), urls.count)
+        let maxToAdd = min(
+            10 - (sharedMediaDataSource.images.count + sharedMediaDataSource.documents.count),
+            urls.count)
         let urlsToProcess = urls.prefix(maxToAdd)
-        
+
         for url in urlsToProcess {
             let fileExtension = url.pathExtension.lowercased()
-            
+
             // Handle image files
             if ["jpg", "jpeg", "png", "gif", "tiff", "webp"].contains(fileExtension) {
                 if let image = NSImage(contentsOf: url) {
@@ -262,31 +292,35 @@ struct MessageBarView: View {
                 }
             }
             // Handle document files
-            else if ["pdf", "csv", "doc", "docx", "xls", "xlsx", "html", "txt", "md"].contains(fileExtension) {
+            else if ["pdf", "csv", "doc", "docx", "xls", "xlsx", "html", "txt", "md"].contains(
+                fileExtension)
+            {
                 do {
                     let fileData = try Data(contentsOf: url)
                     let sanitizedName = sanitizeDocumentName(url.lastPathComponent)
-                    
+
                     logger.info("Adding document: \(sanitizedName), size: \(fileData.count) bytes")
-                    
+
                     sharedMediaDataSource.documents.append(fileData)
-                    
+
                     // Document extensions and filenames need to be added at the correct index
-                    let docIndex = sharedMediaDataSource.images.count + sharedMediaDataSource.documents.count - 1
-                    
+                    let docIndex =
+                        sharedMediaDataSource.images.count + sharedMediaDataSource.documents.count
+                        - 1
+
                     // Expand arrays if needed
                     while sharedMediaDataSource.fileExtensions.count <= docIndex {
                         sharedMediaDataSource.fileExtensions.append("")
                     }
-                    
+
                     while sharedMediaDataSource.filenames.count <= docIndex {
                         sharedMediaDataSource.filenames.append("")
                     }
-                    
+
                     while sharedMediaDataSource.mediaTypes.count <= docIndex {
                         sharedMediaDataSource.mediaTypes.append(.document)
                     }
-                    
+
                     // Set values at the correct index
                     sharedMediaDataSource.fileExtensions[docIndex] = fileExtension
                     sharedMediaDataSource.filenames[docIndex] = sanitizedName
@@ -296,18 +330,18 @@ struct MessageBarView: View {
                 }
             }
         }
-        
+
         // Update attachment list after processing files
         syncAttachments()
     }
 
-    
     private func handleImagePaste(_ image: NSImage) {
         if settingManager.allowImagePasting {
             if sharedMediaDataSource.images.count < 10 {
                 Task {
                     isPasting = true
-                    let (compressedImage, filename, fileExtension) = await processImageInParallel(image)
+                    let (compressedImage, filename, fileExtension) = await processImageInParallel(
+                        image)
                     sharedMediaDataSource.images.append(compressedImage)
                     sharedMediaDataSource.fileExtensions.append(fileExtension)
                     sharedMediaDataSource.filenames.append(filename)
@@ -316,20 +350,21 @@ struct MessageBarView: View {
             }
         }
     }
-    
+
     private func handleTranscriptUpdate(_ newTranscript: String) {
         guard !newTranscript.isEmpty else { return }
-        
+
         DispatchQueue.main.async {
             if !userInput.isEmpty && !userInput.hasSuffix(" ") {
                 userInput += " "
             }
-            
+
             let words = newTranscript.split(separator: " ")
             if let lastWord = words.last {
                 let previousWords = userInput.split(separator: " ")
                 if let prevWord = previousWords.last,
-                   prevWord.lowercased() == lastWord.lowercased() {
+                    prevWord.lowercased() == lastWord.lowercased()
+                {
                     // Skip duplicate word
                 } else {
                     userInput = newTranscript
@@ -337,14 +372,14 @@ struct MessageBarView: View {
             } else {
                 userInput = newTranscript
             }
-            
+
             NotificationCenter.default.post(
                 name: .transcriptUpdated,
                 object: nil
             )
         }
     }
-    
+
     /// Sanitizes document name to comply with Bedrock restrictions
     /// - Only allows alphanumeric characters, single spaces, hyphens, parentheses, and square brackets
     func sanitizeDocumentName(_ name: String) -> String {
@@ -355,16 +390,17 @@ struct MessageBarView: View {
         } else {
             nameWithoutExtension = name
         }
-        
+
         var result = ""
         var lastCharWasSpace = false
-        
+
         // Process each character
         for scalar in nameWithoutExtension.unicodeScalars {
             // Allow only English alphanumeric characters (a-z, A-Z, 0-9)
-            if (scalar.value >= 65 && scalar.value <= 90) ||    // A-Z
-               (scalar.value >= 97 && scalar.value <= 122) ||   // a-z
-               (scalar.value >= 48 && scalar.value <= 57) {     // 0-9
+            if (scalar.value >= 65 && scalar.value <= 90)  // A-Z
+                || (scalar.value >= 97 && scalar.value <= 122)  // a-z
+                || (scalar.value >= 48 && scalar.value <= 57)
+            {  // 0-9
                 result.append(Character(scalar))
                 lastCharWasSpace = false
             }
@@ -376,7 +412,9 @@ struct MessageBarView: View {
                 }
             }
             // Allow specific permitted symbols
-            else if scalar == "-" || scalar == "(" || scalar == ")" || scalar == "[" || scalar == "]" {
+            else if scalar == "-" || scalar == "(" || scalar == ")" || scalar == "["
+                || scalar == "]"
+            {
                 result.append(Character(scalar))
                 lastCharWasSpace = false
             }
@@ -386,10 +424,10 @@ struct MessageBarView: View {
                 lastCharWasSpace = true
             }
         }
-        
+
         // Trim any leading/trailing spaces
         let trimmed = result.trimmingCharacters(in: .whitespacesAndNewlines)
-        
+
         // If the result is empty, provide a default name
         if trimmed.isEmpty {
             // Use current timestamp to create a unique default name
@@ -397,11 +435,10 @@ struct MessageBarView: View {
             dateFormatter.dateFormat = "yyyyMMdd-HHmmss"
             return "Document-\(dateFormatter.string(from: Date()))"
         }
-        
+
         return trimmed
     }
 
-    
     private func setupTranscriptObserver() {
         NotificationCenter.default.addObserver(
             forName: .transcriptUpdated,
@@ -409,75 +446,89 @@ struct MessageBarView: View {
             queue: .main
         ) { _ in }
     }
-    
+
     func getFileName(for index: Int) -> String {
         if index < sharedMediaDataSource.filenames.count,
-           !sharedMediaDataSource.filenames[index].isEmpty {
+            !sharedMediaDataSource.filenames[index].isEmpty
+        {
             return sharedMediaDataSource.filenames[index]
         }
-        
-        let ext = index < sharedMediaDataSource.fileExtensions.count ?
-        sharedMediaDataSource.fileExtensions[index] : "img"
-        
+
+        let ext =
+            index < sharedMediaDataSource.fileExtensions.count
+            ? sharedMediaDataSource.fileExtensions[index] : "img"
+
         let dateFormatter = DateFormatter()
         dateFormatter.dateFormat = "yyyyMMdd_HHmmss"
         return "attachment_\(dateFormatter.string(from: Date())).\(ext)"
     }
-    
+
     private func syncAttachments() {
         // Debug info
         logger.info("Starting syncAttachments")
-        logger.info("Images: \(sharedMediaDataSource.images.count), Documents: \(sharedMediaDataSource.documents.count)")
-        logger.info("MediaTypes: \(sharedMediaDataSource.mediaTypes.count), Extensions: \(sharedMediaDataSource.fileExtensions.count)")
-        
+        logger.info(
+            "Images: \(sharedMediaDataSource.images.count), Documents: \(sharedMediaDataSource.documents.count)"
+        )
+        logger.info(
+            "MediaTypes: \(sharedMediaDataSource.mediaTypes.count), Extensions: \(sharedMediaDataSource.fileExtensions.count)"
+        )
+
         // Clear current attachments first
         attachments.removeAll()
         documentAttachments.removeAll()
-        
+
         // Sync image attachments
         for i in 0..<sharedMediaDataSource.images.count {
-            let fileExt = i < sharedMediaDataSource.fileExtensions.count ?
-                sharedMediaDataSource.fileExtensions[i] : "jpg"
-                
-            let filename = i < sharedMediaDataSource.filenames.count ?
-                sharedMediaDataSource.filenames[i] : "image\(i+1).\(fileExt)"
-                
+            let fileExt =
+                i < sharedMediaDataSource.fileExtensions.count
+                ? sharedMediaDataSource.fileExtensions[i] : "jpg"
+
+            let filename =
+                i < sharedMediaDataSource.filenames.count
+                ? sharedMediaDataSource.filenames[i] : "image\(i+1).\(fileExt)"
+
             logger.info("Adding image attachment: \(filename) with ext \(fileExt)")
-            
-            attachments.append(ImageAttachment(
-                image: sharedMediaDataSource.images[i],
-                fileExtension: fileExt,
-                filename: filename
-            ))
+
+            attachments.append(
+                ImageAttachment(
+                    image: sharedMediaDataSource.images[i],
+                    fileExtension: fileExt,
+                    filename: filename
+                ))
         }
-        
+
         // Sync document attachments
         for i in 0..<sharedMediaDataSource.documents.count {
             // Calculate correct index for accessing extensions and filenames
             let docIndex = sharedMediaDataSource.images.count + i
-            
-            let fileExt = docIndex < sharedMediaDataSource.fileExtensions.count ?
-                sharedMediaDataSource.fileExtensions[docIndex] : "pdf"
-                
-            let filename = docIndex < sharedMediaDataSource.filenames.count ?
-                sharedMediaDataSource.filenames[docIndex] : "document\(i+1).\(fileExt)"
-                
+
+            let fileExt =
+                docIndex < sharedMediaDataSource.fileExtensions.count
+                ? sharedMediaDataSource.fileExtensions[docIndex] : "pdf"
+
+            let filename =
+                docIndex < sharedMediaDataSource.filenames.count
+                ? sharedMediaDataSource.filenames[docIndex] : "document\(i+1).\(fileExt)"
+
             logger.info("Adding document attachment: \(filename) with ext \(fileExt)")
-            
-            documentAttachments.append(DocumentAttachment(
-                data: sharedMediaDataSource.documents[i],
-                fileExtension: fileExt,
-                filename: filename
-            ))
+
+            documentAttachments.append(
+                DocumentAttachment(
+                    data: sharedMediaDataSource.documents[i],
+                    fileExtension: fileExt,
+                    filename: filename
+                ))
         }
-        
-        logger.info("After sync: Image attachments: \(attachments.count), Document attachments: \(documentAttachments.count)")
+
+        logger.info(
+            "After sync: Image attachments: \(attachments.count), Document attachments: \(documentAttachments.count)"
+        )
     }
-    
+
     func removeAttachment(withId id: UUID) {
         if let index = attachments.firstIndex(where: { $0.id == id }) {
             attachments.remove(at: index)
-            
+
             if index < sharedMediaDataSource.images.count {
                 sharedMediaDataSource.images.remove(at: index)
             }
@@ -489,15 +540,15 @@ struct MessageBarView: View {
             }
         }
     }
-    
+
     func removeDocumentAttachment(withId id: UUID) {
         if let index = documentAttachments.firstIndex(where: { $0.id == id }) {
             documentAttachments.remove(at: index)
-            
+
             // Find the corresponding index in the shared data source
             var docIndex = -1
             var count = 0
-            
+
             for (i, type) in sharedMediaDataSource.mediaTypes.enumerated() {
                 if type == .document {
                     if count == index {
@@ -507,7 +558,7 @@ struct MessageBarView: View {
                     count += 1
                 }
             }
-            
+
             if docIndex >= 0 {
                 sharedMediaDataSource.documents.remove(at: index)
                 sharedMediaDataSource.mediaTypes.remove(at: docIndex)
@@ -520,7 +571,7 @@ struct MessageBarView: View {
             }
         }
     }
-    
+
     func removeAllAttachments() {
         withAnimation {
             attachments.removeAll()
@@ -529,27 +580,30 @@ struct MessageBarView: View {
             sharedMediaDataSource.filenames.removeAll()
         }
     }
-    
+
     private func processImageInParallel(_ image: NSImage) async -> (NSImage, String, String) {
         return await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
                 let compressedImage: NSImage
                 let fileExtension: String
-                
+
                 // 여기서 NSBitmapImageRep.FileType을 사용하도록 변경
-                if let compressedData = image.compressedData(maxFileSize: 1024 * 1024, maxDimension: 1024, format: NSBitmapImageRep.FileType.jpeg),
-                   let processedImage = NSImage(data: compressedData) {
+                if let compressedData = image.compressedData(
+                    maxFileSize: 1024 * 1024, maxDimension: 1024,
+                    format: NSBitmapImageRep.FileType.jpeg),
+                    let processedImage = NSImage(data: compressedData)
+                {
                     compressedImage = processedImage
                     fileExtension = "jpeg"
                 } else {
                     compressedImage = image
                     fileExtension = "png"
                 }
-                
+
                 let dateFormatter = DateFormatter()
                 dateFormatter.dateFormat = "yyyyMMdd_HHmmss"
                 let filename = "pasted_image_\(dateFormatter.string(from: Date())).\(fileExtension)"
-                
+
                 continuation.resume(returning: (compressedImage, filename, fileExtension))
             }
         }
@@ -577,87 +631,84 @@ struct AdvancedOptionsMenu: View {
     @Binding var userInput: String
     @ObservedObject var settingManager: SettingManager
     var modelId: String
-    
+
     // Check if current model supports reasoning/thinking
     private var supportsThinking: Bool {
         let id = modelId.lowercased()
         // Claude 3.7 and DeepSeek R1 support thinking
-        return id.contains("claude-3-7") || id.contains("claude-sonnet-4") ||  id.contains("claude-opus-4") || id.contains("deepseek") && id.contains("r1")
+        return id.contains("claude-3-7") || id.contains("claude-sonnet-4")
+            || id.contains("claude-opus-4") || id.contains("deepseek") && id.contains("r1")
     }
-    
+
     // Check if model has always-on reasoning that can't be toggled
     private var hasAlwaysOnThinking: Bool {
         let id = modelId.lowercased()
         // DeepSeek R1 has always-on thinking
         return id.contains("deepseek") && id.contains("r1")
     }
-    
+
     // Check if thinking toggle should be shown
     private var shouldShowThinkingToggle: Bool {
         return supportsThinking && !hasAlwaysOnThinking
     }
-    
+
     // Check if current model supports streaming tool use
     private var supportsStreamingTools: Bool {
         let id = modelId.lowercased()
         return (
             // Claude models (3 and 4 series)
-            (id.contains("claude-3") && !id.contains("haiku")) ||
-            id.contains("claude-sonnet-4") ||
-            id.contains("claude-opus-4") ||
-            
+            (id.contains("claude-3") && !id.contains("haiku")) || id.contains("claude-sonnet-4")
+            || id.contains("claude-opus-4")
+
             // Amazon Nova models
-            (id.contains("amazon") && (
-                id.contains("nova-pro") ||
-                id.contains("nova-lite") ||
-                id.contains("nova-micro") ||
-                id.contains("nova-premier")
-            )) ||
-            
+            || (id.contains("amazon")
+                && (id.contains("nova-pro") || id.contains("nova-lite") || id.contains("nova-micro")
+                    || id.contains("nova-premier")))
+
             // Cohere Command-R models
-            (id.contains("cohere") && id.contains("command-r")) ||
-            
+            || (id.contains("cohere") && id.contains("command-r"))
+
             // AI21 Jamba models (except Instruct)
-            (id.contains("ai21") && id.contains("jamba") && !id.contains("instruct")) ||
-            
+            || (id.contains("ai21") && id.contains("jamba") && !id.contains("instruct"))
+
             // OpenAI GPT-OSS models
-            (id.contains("openai") && id.contains("gpt-oss"))
-        )
+            || (id.contains("openai") && id.contains("gpt-oss")))
     }
 
     // Check if MCP tools should be available and shown
     private var shouldShowMCPTools: Bool {
-        return settingManager.mcpEnabled && !MCPManager.shared.toolInfos.isEmpty && supportsStreamingTools
+        return settingManager.mcpEnabled && !MCPManager.shared.toolInfos.isEmpty
+            && supportsStreamingTools
     }
-    
+
     var body: some View {
         Menu {
             Text("More Options")
                 .font(.headline)
                 .foregroundColor(.secondary)
-            
+
             // Show thinking toggle for models that support configurable reasoning
             if shouldShowThinkingToggle {
                 Toggle("Enable Thinking", isOn: $settingManager.enableModelThinking)
                     .help("Allow the model to show its thinking process")
             }
-            
+
             // For models with always-on thinking, show an informative option
             if hasAlwaysOnThinking {
                 Text("Thinking: Always On")
                     .foregroundColor(.secondary)
                     .help("This model always includes its thinking process")
             }
-            
+
             Toggle("Allow Image Pasting", isOn: $settingManager.allowImagePasting)
                 .help("Enable or disable image pasting functionality")
-            
+
             // MCP tools section - only show if model supports streaming tool use
             if shouldShowMCPTools {
                 Divider()
-                
+
                 Text("Available Tools").bold()
-                
+
                 ForEach(MCPManager.shared.toolInfos) { tool in
                     Button {
                     } label: {
@@ -666,10 +717,10 @@ struct AdvancedOptionsMenu: View {
                     .help(tool.description)
                 }
             }
-            
+
             if !settingManager.systemPrompt.isEmpty {
                 Divider()
-                
+
                 Button {
                     let alert = NSAlert()
                     alert.messageText = "System Prompt"
@@ -681,9 +732,11 @@ struct AdvancedOptionsMenu: View {
                 }
             }
         } label: {
-            Image(systemName: shouldShowMCPTools
-                  ? "plus.circle.fill"
-                  : "plus.circle")
+            Image(
+                systemName: shouldShowMCPTools
+                    ? "plus.circle.fill"
+                    : "plus.circle"
+            )
             .font(.system(size: 16, weight: .regular))
             .foregroundColor(.primary)
         }
@@ -709,20 +762,20 @@ struct AttachmentListView: View {
     var onRemoveAttachment: (UUID) -> Void
     var onRemoveDocumentAttachment: (UUID) -> Void
     var onRemoveAllAttachments: () -> Void
-    
+
     var logger = Logger(label: "AttachmentListView")
-    
+
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             // Header
             HStack {
                 let totalAttachments = attachments.count + documentAttachments.count
-                
+
                 Text("Attachments (\(totalAttachments))")
                     .font(.system(size: 13, weight: .medium))
-                
+
                 Spacer()
-                
+
                 if totalAttachments > 1 {
                     Button(action: onRemoveAllAttachments) {
                         Text("Clear all")
@@ -735,7 +788,7 @@ struct AttachmentListView: View {
             }
             .padding(.horizontal, 34)
             .padding(.top, 8)
-            
+
             // Combined attachment list (images + documents)
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 8) {
@@ -749,14 +802,16 @@ struct AttachmentListView: View {
                                 onRemoveAttachment(attachment.id)
                             },
                             onClick: {
-                                if let index = attachments.firstIndex(where: { $0.id == attachment.id }) {
+                                if let index = attachments.firstIndex(where: {
+                                    $0.id == attachment.id
+                                }) {
                                     selectedImageIndex = index
                                     showImagePreview = true
                                 }
                             }
                         )
                     }
-                    
+
                     // Documents
                     ForEach(documentAttachments) { document in
                         MediaAttachmentView(
@@ -777,7 +832,7 @@ struct AttachmentListView: View {
                 Button(action: onRemoveAllAttachments) {
                     Label("Delete All Attachments", systemImage: "trash")
                 }
-                
+
                 if !attachments.isEmpty {
                     Button(action: {
                         saveAllImages()
@@ -788,7 +843,7 @@ struct AttachmentListView: View {
             }
         }
     }
-    
+
     private func saveAllImages() {
         let panel = NSOpenPanel()
         panel.canChooseFiles = false
@@ -797,7 +852,7 @@ struct AttachmentListView: View {
         panel.canCreateDirectories = true
         panel.prompt = "Select Folder"
         panel.message = "Choose a folder to save all images"
-        
+
         panel.begin { response in
             if response == .OK, let url = panel.url {
                 Task {
@@ -808,24 +863,27 @@ struct AttachmentListView: View {
             }
         }
     }
-    
+
     private func saveImage(_ image: NSImage, at index: Int, to folderURL: URL) {
         let filename = getFilename(for: index)
         let fileURL = folderURL.appendingPathComponent(filename)
-        
+
         if let tiffData = image.tiffRepresentation,
-           let bitmapImage = NSBitmapImageRep(data: tiffData) {
-            let fileExtension = index < sharedMediaDataSource.fileExtensions.count ?
-            sharedMediaDataSource.fileExtensions[index] : "jpg"
-            
+            let bitmapImage = NSBitmapImageRep(data: tiffData)
+        {
+            let fileExtension =
+                index < sharedMediaDataSource.fileExtensions.count
+                ? sharedMediaDataSource.fileExtensions[index] : "jpg"
+
             let imageData: Data?
             switch fileExtension.lowercased() {
             case "jpg", "jpeg":
-                imageData = bitmapImage.representation(using: .jpeg, properties: [.compressionFactor: 0.9])
+                imageData = bitmapImage.representation(
+                    using: .jpeg, properties: [.compressionFactor: 0.9])
             default:
                 imageData = bitmapImage.representation(using: .png, properties: [:])
             }
-            
+
             if let data = imageData {
                 do {
                     try data.write(to: fileURL)
@@ -835,16 +893,18 @@ struct AttachmentListView: View {
             }
         }
     }
-    
+
     private func getFilename(for index: Int) -> String {
         if index < sharedMediaDataSource.filenames.count,
-           !sharedMediaDataSource.filenames[index].isEmpty {
+            !sharedMediaDataSource.filenames[index].isEmpty
+        {
             return sharedMediaDataSource.filenames[index]
         }
-        
-        let ext = index < sharedMediaDataSource.fileExtensions.count ?
-        sharedMediaDataSource.fileExtensions[index] : "img"
-        
+
+        let ext =
+            index < sharedMediaDataSource.fileExtensions.count
+            ? sharedMediaDataSource.fileExtensions[index] : "img"
+
         let dateFormatter = DateFormatter()
         dateFormatter.dateFormat = "yyyyMMdd_HHmmss"
         return "attachment_\(dateFormatter.string(from: Date())).\(ext)"
@@ -854,16 +914,16 @@ struct AttachmentListView: View {
 struct MediaAttachmentView: View {
     enum AttachmentType {
         case image(NSImage)
-        case document(String) // Document extension
+        case document(String)  // Document extension
     }
-    
+
     var attachmentType: AttachmentType
     var filename: String
     var fileExtension: String
     var onDelete: () -> Void
     var onClick: (() -> Void)? = nil
     @Environment(\.colorScheme) private var colorScheme
-    
+
     var body: some View {
         VStack(spacing: 4) {
             // Thumbnail or icon
@@ -879,13 +939,13 @@ struct MediaAttachmentView: View {
                             .clipped()
                     }
                     .buttonStyle(PlainButtonStyle())
-                    
+
                 case .document(let ext):
                     ZStack {
                         RoundedRectangle(cornerRadius: 6)
                             .fill(Color.gray.opacity(0.1))
                             .frame(width: 60, height: 60)
-                        
+
                         Image(systemName: documentIcon(for: ext))
                             .font(.system(size: 24))
                             .foregroundColor(.primary)
@@ -900,12 +960,13 @@ struct MediaAttachmentView: View {
                 Button(action: onDelete) {
                     ZStack {
                         Circle()
-                            .fill(colorScheme == .dark ?
-                                  Color(white: 0.2).opacity(0.8) :
-                                  Color.white.opacity(0.9))
+                            .fill(
+                                colorScheme == .dark
+                                    ? Color(white: 0.2).opacity(0.8) : Color.white.opacity(0.9)
+                            )
                             .frame(width: 20, height: 20)
                             .shadow(color: Color.black.opacity(0.2), radius: 1, x: 0, y: 1)
-                        
+
                         Image(systemName: "xmark")
                             .font(.system(size: 8, weight: .bold))
                             .foregroundColor(colorScheme == .dark ? .white : .black)
@@ -914,7 +975,7 @@ struct MediaAttachmentView: View {
                 .buttonStyle(PlainButtonStyle()),
                 alignment: .topTrailing
             )
-            
+
             Text(filename.count > 10 ? String(filename.prefix(7)) + "..." : filename)
                 .font(.system(size: 10))
                 .foregroundColor(.secondary)
@@ -923,7 +984,7 @@ struct MediaAttachmentView: View {
         }
         .frame(width: 70, height: 80)
     }
-    
+
     // Get icon based on file extension
     private func documentIcon(for extension: String) -> String {
         switch fileExtension.lowercased() {

@@ -65,3 +65,4 @@ Podfile.lock
 DerivedData/
 
 /build
+Amazon Bedrock Client for Mac.xcodeproj/test.json

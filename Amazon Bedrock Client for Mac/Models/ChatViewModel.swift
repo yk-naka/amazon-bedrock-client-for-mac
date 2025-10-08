@@ -198,8 +198,32 @@ class ChatViewModel: ObservableObject {
     // Track current message ID being streamed to fix duplicate issue
     private var currentStreamingMessageId: UUID?
 
+    // NEW: Track the last sent message to prevent immediate duplicates
+    private var lastSentMessageText: String = ""
+    private var lastSentMessageTime: Date = Date.distantPast
+
+    // NEW: Actor for exclusive message sending to prevent race conditions
+    private let sendLock = SendMessageLock()
+
     // Usage handler for displaying token usage information
     var usageHandler: ((String) -> Void)?
+
+    // Actor to ensure only one message is being sent at a time
+    actor SendMessageLock {
+        private var isLocked = false
+
+        func tryLock(messageText: String) -> Bool {
+            guard !isLocked else {
+                return false
+            }
+            isLocked = true
+            return true
+        }
+
+        func unlock() {
+            isLocked = false
+        }
+    }
 
     // Edit/Delete/OrganizeContext notification handlers
     private var editMessageNotification: AnyCancellable?
@@ -398,11 +422,162 @@ class ChatViewModel: ObservableObject {
     // MARK: - Public Methods
 
     func loadInitialData() {
-        messages = chatManager.getMessages(for: chatId)
+        let loadedMessages = chatManager.getMessages(for: chatId)
+
+        // NEW: Remove consecutive duplicate messages on load
+        messages = removeDuplicateConsecutiveMessages(loadedMessages)
+
+        // If duplicates were removed, save the cleaned messages back
+        if messages.count < loadedMessages.count {
+            logger.info(
+                "🔧 Removed \(loadedMessages.count - messages.count) duplicate messages on load")
+
+            // Clean and resave to storage and history
+            Task {
+                await cleanAndResaveMessages()
+            }
+        }
+    }
+
+    /// Removes consecutive duplicate messages (same role, same text)
+    private func removeDuplicateConsecutiveMessages(_ messages: [MessageData]) -> [MessageData] {
+        guard messages.count > 1 else { return messages }
+
+        var cleaned: [MessageData] = []
+        var previousMessage: MessageData? = nil
+
+        for message in messages {
+            // Check if this is a duplicate of the previous message
+            if let prev = previousMessage,
+                prev.user == message.user,
+                prev.text == message.text,
+                !prev.isError && !message.isError
+            {
+                // Skip this duplicate
+                logger.info(
+                    "🔧 Skipping duplicate message: '\(message.text.prefix(50))...' from \(message.user)"
+                )
+                continue
+            }
+
+            cleaned.append(message)
+            previousMessage = message
+        }
+
+        return cleaned
+    }
+
+    /// Cleans and resaves messages to storage and history
+    private func cleanAndResaveMessages() async {
+        // Rebuild conversation history from cleaned messages
+        var cleanedHistory: [BedrockMessage] = []
+
+        for message in messages {
+            let role: MessageRole = message.user == "User" ? .user : .assistant
+
+            // CRITICAL: Check for tool_result user messages FIRST
+            if role == .user, let toolUse = message.toolUse, let toolResult = message.toolResult {
+                // User message with tool_result: Create ONLY tool_result block
+                let toolResultMessage = BedrockMessage(
+                    role: role,
+                    content: [
+                        .toolresult(
+                            MessageContent.ToolResultContent(
+                                toolUseId: toolUse.id,
+                                result: toolResult,
+                                status: "success"
+                            ))
+                    ]
+                )
+                cleanedHistory.append(toolResultMessage)
+                logger.debug(
+                    "🔧 [CleanAndResave] Created STRICT tool_result-only user message for tool ID: \(toolUse.id)"
+                )
+                continue  // Skip all other content processing for this message
+            }
+
+            var contents: [MessageContent] = []
+
+            // Add text
+            if !message.text.isEmpty {
+                contents.append(.text(message.text))
+            }
+
+            // Add thinking if present
+            if let thinking = message.thinking, !thinking.isEmpty {
+                contents.append(
+                    .thinking(
+                        MessageContent.ThinkingContent(
+                            text: thinking,
+                            signature: message.signature ?? UUID().uuidString
+                        )))
+            }
+
+            // Add images if present
+            if let imageBase64Strings = message.imageBase64Strings {
+                for base64 in imageBase64Strings {
+                    contents.append(
+                        .image(
+                            MessageContent.ImageContent(
+                                format: .jpeg,
+                                base64Data: base64
+                            )))
+                }
+            }
+
+            // Add documents if present
+            if let docBase64 = message.documentBase64Strings,
+                let docFormats = message.documentFormats,
+                let docNames = message.documentNames
+            {
+                for i in 0..<min(docBase64.count, min(docFormats.count, docNames.count)) {
+                    contents.append(
+                        .document(
+                            MessageContent.DocumentContent(
+                                format: MessageContent.DocumentFormat.fromExtension(docFormats[i]),
+                                base64Data: docBase64[i],
+                                name: docNames[i]
+                            )))
+                }
+            }
+
+            // Add tool use for assistant messages only
+            // CRITICAL: User tool_result messages are handled separately above
+            if role == .assistant, let toolUse = message.toolUse {
+                contents.append(
+                    .tooluse(
+                        MessageContent.ToolUseContent(
+                            toolUseId: toolUse.id,
+                            name: toolUse.name,
+                            input: toolUse.input
+                        )))
+            }
+
+            if !contents.isEmpty {
+                cleanedHistory.append(BedrockMessage(role: role, content: contents))
+            }
+        }
+
+        // Save cleaned history
+        await saveConversationHistory(cleanedHistory)
+        logger.info(
+            "✅ Cleaned and resaved conversation history with \(cleanedHistory.count) messages")
     }
 
     func sendMessage() {
         guard !userInput.isEmpty else { return }
+
+        // Prevent duplicate sends - check if already sending
+        guard !isSending else {
+            logger.warning("⚠️ Message send blocked: Already sending a message")
+            return
+        }
+
+        // Prevent duplicate sends - check if message bar is disabled
+        guard !isMessageBarDisabled else {
+            logger.warning("⚠️ Message send blocked: Message bar is disabled")
+            return
+        }
 
         messageTask?.cancel()
         messageTask = Task { await sendMessageAsync() }
@@ -560,16 +735,49 @@ class ChatViewModel: ObservableObject {
     // MARK: - Private Message Handling Methods
 
     private func sendMessageAsync() async {
+        // NEW: Actor-based exclusive lock to prevent race conditions
+        let messageText = userInput
+        let canProceed = await sendLock.tryLock(messageText: messageText)
+
+        guard canProceed else {
+            logger.error(
+                "🚫 CRITICAL: Another sendMessageAsync() is already running - BLOCKED by actor lock")
+            return
+        }
+
+        // Ensure we unlock when done (using defer)
+        defer {
+            Task {
+                await sendLock.unlock()
+            }
+        }
+
+        let now = Date()
+
+        // Check if this is a duplicate of the last sent message
+        if messageText == lastSentMessageText && now.timeIntervalSince(lastSentMessageTime) < 2.0 {
+            logger.error(
+                "🚫 CRITICAL: Duplicate sendMessageAsync() blocked - same message sent \(now.timeIntervalSince(lastSentMessageTime)) seconds ago"
+            )
+            return
+        }
+
+        // Update tracking before any async operations
+        lastSentMessageText = messageText
+        lastSentMessageTime = now
+
+        // Set sending flag immediately to prevent duplicate sends
+        isSending = true
         chatManager.setIsLoading(true, for: chatId)
         isMessageBarDisabled = true
 
-        let tempInput = userInput
+        let tempInput = messageText
         Task {
             await updateChatTitle(with: tempInput)
         }
 
         let userMessage = createUserMessage()
-        addMessage(userMessage)
+        addUIOnlyMessage(userMessage)
 
         userInput = ""
         sharedMediaDataSource.images.removeAll()
@@ -623,6 +831,7 @@ class ChatViewModel: ObservableObject {
 
         isMessageBarDisabled = false
         chatManager.setIsLoading(false, for: chatId)
+        isSending = false
     }
 
     private func createUserMessage() -> MessageData {
@@ -914,14 +1123,34 @@ class ChatViewModel: ObservableObject {
             }
         }
 
-        // Get conversation history and add new user message
-        var conversationHistory = await getConversationHistory()
+        // Get conversation history (完全な履歴)
+        var fullConversationHistory = await getConversationHistory()
 
-        // Add the current user message to conversation history
+        // Add the current user message to conversation history（直前が同一ユーザー同一テキストならスキップ）
         let userBedrockMessage = BedrockMessage(role: .user, content: messageContents)
-        conversationHistory.append(userBedrockMessage)
+        let newUserText = extractTextFromContents(userBedrockMessage.content)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
 
-        await saveConversationHistory(conversationHistory)
+        var shouldAppendUser = true
+        if let last = fullConversationHistory.last {
+            let lastText = extractTextFromContents(last.content)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if last.role == .user && !newUserText.isEmpty && lastText == newUserText {
+                shouldAppendUser = false
+                logger.warning(
+                    "🔧 Blocked duplicate user message append to history: '\(newUserText.prefix(50))...'"
+                )
+            }
+        }
+        if shouldAppendUser {
+            fullConversationHistory.append(userBedrockMessage)
+        }
+
+        // 完全な履歴を保存（要約されない）
+        await saveConversationHistory(fullConversationHistory)
+
+        // Bedrock送信用に最適化された履歴を取得
+        let optimizedHistory = await manageConversationByCharacterCount(fullConversationHistory)
 
         // Get system prompt
         let systemPrompt = settingManager.systemPrompt.trimmingCharacters(
@@ -949,8 +1178,8 @@ class ChatViewModel: ObservableObject {
         let maxTurns = settingManager.maxToolUseTurns
         var turn_count = 0
 
-        // Get Bedrock messages in AWS SDK format
-        let bedrockMessages = try conversationHistory.map {
+        // Get Bedrock messages in AWS SDK format (最適化された履歴を使用)
+        let bedrockMessages = try optimizedHistory.map {
             try convertToBedrockMessage($0, modelId: chatModel.id)
         }
 
@@ -959,6 +1188,9 @@ class ChatViewModel: ObservableObject {
             systemPrompt.isEmpty ? nil : [.text(systemPrompt)]
 
         logger.info("Starting converseStream request with model ID: \(chatModel.id)")
+        logger.info(
+            "Sending \(bedrockMessages.count) optimized messages to Bedrock (full history: \(fullConversationHistory.count) messages)"
+        )
 
         // Start the tool cycling process
         try await processToolCycles(
@@ -966,18 +1198,94 @@ class ChatViewModel: ObservableObject {
             toolConfig: toolConfig, turnCount: turn_count, maxTurns: maxTurns)
     }
 
-    // Process tool cycles recursively
+    // Process tool cycles recursively with enhanced error handling
     private func processToolCycles(
         bedrockMessages: [AWSBedrockRuntime.BedrockRuntimeClientTypes.Message],
         systemContentBlock: [AWSBedrockRuntime.BedrockRuntimeClientTypes.SystemContentBlock]?,
         toolConfig: AWSBedrockRuntime.BedrockRuntimeClientTypes.ToolConfiguration?,
         turnCount: Int,
-        maxTurns: Int
+        maxTurns: Int,
+        currentFullHistory: [BedrockMessage]? = nil
     ) async throws {
         // Check if we've reached maximum turns
         if turnCount >= maxTurns {
             logger.info("Maximum number of tool use turns (\(maxTurns)) reached")
             return
+        }
+
+        // CRITICAL: Validate history consistency at the start of each cycle
+        if let currentHistory = currentFullHistory, !currentHistory.isEmpty {
+            let lastMessage = currentHistory.last!
+
+            // Check for consecutive assistant messages (should never happen)
+            if currentHistory.count >= 2 {
+                let secondToLast = currentHistory[currentHistory.count - 2]
+                if lastMessage.role == .assistant && secondToLast.role == .assistant {
+                    logger.error("🚨 CRITICAL: Detected consecutive assistant messages in history!")
+                    logger.error(
+                        "  Second-to-last: \(extractTextFromContents(secondToLast.content).prefix(50))..."
+                    )
+                    logger.error(
+                        "  Last: \(extractTextFromContents(lastMessage.content).prefix(50))...")
+
+                    // This should never happen - indicates a logic error
+                    throw ToolUseError(message: "会話履歴に連続するアシスタントメッセージが検出されました。システムエラーの可能性があります。")
+                }
+            }
+
+            logger.info(
+                "✅ History consistency check passed: \(currentHistory.count) messages, last role: \(lastMessage.role)"
+            )
+        }
+
+        // NEW: Sanitize messages before validation (auto-fix common issues)
+        // Use strict sanitizer that preserves tool_use -> tool_result adjacency
+        let sanitizedMessages = sanitizeMessagesStrict(bedrockMessages)
+
+        // Enhanced logging before validation
+        logger.info(
+            "📊 About to validate \(sanitizedMessages.count) sanitized messages for API call")
+        for (index, message) in sanitizedMessages.enumerated() {
+            let role = message.role ?? .user
+            let contentCount = message.content?.count ?? 0
+            var contentTypes: [String] = []
+
+            if let contents = message.content {
+                for content in contents {
+                    switch content {
+                    case .text(_): contentTypes.append("text")
+                    case .image(_): contentTypes.append("image")
+                    case .document(_): contentTypes.append("document")
+                    case .tooluse(let toolUse):
+                        if let toolUseId = toolUse.toolUseId {
+                            contentTypes.append("tool_use[\(toolUseId.suffix(8))]")
+                        }
+                    case .toolresult(let toolResult):
+                        if let toolUseId = toolResult.toolUseId {
+                            contentTypes.append("tool_result[\(toolUseId.suffix(8))]")
+                        }
+                    default: contentTypes.append("other")
+                    }
+                }
+            }
+
+            logger.info(
+                "  Message[\(index)]: \(role), \(contentCount) blocks: \(contentTypes.joined(separator: ", "))"
+            )
+        }
+
+        // Pre-validate message structure before API call
+        do {
+            try validateMessageStructure(sanitizedMessages)
+        } catch {
+            logger.error("❌ Message validation failed before API call: \(error)")
+            logger.error("📋 Dumping message structure for debugging:")
+            for (index, message) in sanitizedMessages.enumerated() {
+                logger.error(
+                    "  Message[\(index)]: role=\(message.role?.rawValue ?? "nil"), content_count=\(message.content?.count ?? 0)"
+                )
+            }
+            throw ToolUseError(message: "メッセージ構造の検証に失敗しました: \(error.localizedDescription)")
         }
 
         // State variables for this conversation turn
@@ -986,7 +1294,13 @@ class ChatViewModel: ObservableObject {
         var thinkingSignature: String? = nil
         var isFirstChunk = true
         var toolWasUsed = false
-        var conversationHistory = await getConversationHistory()
+        // CRITICAL FIX: 履歴をDBから読み直さず、メモリ上の最新履歴を使用
+        var fullConversationHistory: [BedrockMessage]
+        if let currentHistory = currentFullHistory {
+            fullConversationHistory = currentHistory
+        } else {
+            fullConversationHistory = await getConversationHistory()
+        }
 
         // Use for message ID tracking
         let messageId = UUID()
@@ -996,10 +1310,10 @@ class ChatViewModel: ObservableObject {
         // Reset tool tracker
         await ToolUseTracker.shared.reset()
 
-        // Stream chunks from the model
+        // Stream chunks from the model (use sanitized messages)
         for try await chunk in try await backendModel.backend.converseStream(
             withId: chatModel.id,
-            messages: bedrockMessages,
+            messages: sanitizedMessages,
             systemContent: systemContentBlock,
             inferenceConfig: nil,
             toolConfig: toolConfig,
@@ -1032,7 +1346,7 @@ class ChatViewModel: ObservableObject {
                         sentTime: Date(),
                         toolUse: currentToolInfo
                     )
-                    addMessage(initialMessage)
+                    addUIOnlyMessage(initialMessage)
                     isFirstChunk = false
                 } else {
                     // If message already exists, keep text as is and only update tool info
@@ -1093,11 +1407,28 @@ class ChatViewModel: ObservableObject {
                     toolResult: resultText
                 )
 
-                // Important: Create tool result message without including full result in conversation history
-                // This follows Python's approach and avoids ValidationException errors about toolResult/toolUse mismatches
-                // Override the main 'text' with "[Tool Result Reference--XXB]" if this user message represents a tool result
-                // This makes loading simpler and ensures the result text is preserved in MessageView by creating emptyview.
-                let toolResultMessage = BedrockMessage(
+                // CRITICAL FIX: Create tool messages in AWS Bedrock API compliant format
+                // AWS Bedrock requires EXACT pairing: assistant(tool_use) -> user(tool_result)
+
+                // 1. Assistant message with ONLY tool_use (minimal text)
+                let assistantWithToolUse = BedrockMessage(
+                    role: .assistant,
+                    content: createMinimalToolUseMessage(
+                        text: preservedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                            ? "I'll help you with that." : preservedText,
+                        thinking: thinking,
+                        thinkingSignature: thinkingSignature,
+                        toolUse: MessageContent.ToolUseContent(
+                            toolUseId: toolUseInfo.toolUseId,
+                            name: toolUseInfo.name,
+                            input: currentToolInfo!.input
+                        ),
+                        modelId: chatModel.id
+                    )
+                )
+
+                // 2. User message with ONLY tool_result (no other content)
+                let userWithToolResult = BedrockMessage(
                     role: .user,
                     content: [
                         .toolresult(
@@ -1109,70 +1440,83 @@ class ChatViewModel: ObservableObject {
                     ]
                 )
 
-                // For assistant message in history with tool use - preserve original assistant text
-                let assistantMessage: BedrockMessage
+                // CRITICAL: Before adding tool pair, verify no duplicate assistant messages
+                if let lastMessage = fullConversationHistory.last {
+                    if lastMessage.role == .assistant {
+                        // Check if this is a duplicate (same text content)
+                        let lastText = extractTextFromContents(lastMessage.content)
+                            .trimmingCharacters(in: .whitespacesAndNewlines)
+                        let newText = preservedText.trimmingCharacters(in: .whitespacesAndNewlines)
 
-                if let existingThinking = thinking, let existingSignature = thinkingSignature {
-                    // thinking이 있는 경우 - thinking, text, tooluse 순서로 추가
-                    assistantMessage = BedrockMessage(
-                        role: .assistant,
-                        content: [
-                            .thinking(
-                                MessageContent.ThinkingContent(
-                                    text: existingThinking,
-                                    signature: existingSignature
-                                )),
-                            .text(
-                                preservedText.trimmingCharacters(in: .whitespacesAndNewlines)
-                                    .isEmpty ? "Analyzing your request..." : preservedText),
-                            .tooluse(
-                                MessageContent.ToolUseContent(
-                                    toolUseId: toolUseInfo.toolUseId,
-                                    name: toolUseInfo.name,
-                                    input: currentToolInfo!.input
-                                )),
-                        ]
-                    )
-                } else {
-                    // thinking이 없는 경우 - reasoning 비활성화 옵션을 사용해야 함
-                    // 따라서 API 호출 시 inferenceConfig에서 reasoning 비활성화 필요
-                    assistantMessage = BedrockMessage(
-                        role: .assistant,
-                        content: [
-                            .text(
-                                preservedText.trimmingCharacters(in: .whitespacesAndNewlines)
-                                    .isEmpty ? "Analyzing your request..." : preservedText),
-                            .tooluse(
-                                MessageContent.ToolUseContent(
-                                    toolUseId: toolUseInfo.toolUseId,
-                                    name: toolUseInfo.name,
-                                    input: currentToolInfo!.input
-                                )),
-                        ]
-                    )
+                        if lastText == newText && !newText.isEmpty {
+                            logger.warning(
+                                "🔧 Detected duplicate assistant message before adding tool pair, removing duplicate"
+                            )
+                            fullConversationHistory.removeLast()
+                        }
+                    }
                 }
 
-                // Add both messages to history
-                conversationHistory.append(assistantMessage)
-                conversationHistory.append(toolResultMessage)
+                // Add messages in STRICT order: assistant(tool_use) first, then user(tool_result)
+                fullConversationHistory.append(assistantWithToolUse)
+                fullConversationHistory.append(userWithToolResult)
 
-                logger.debug("Added assistant message with tool_use ID: \(toolUseInfo.toolUseId)")
-                logger.debug("Added user message with tool_result ID: \(toolUseInfo.toolUseId)")
+                logger.info(
+                    "✅ Added AWS compliant tool pair: assistant(tool_use) -> user(tool_result) for ID: \(toolUseInfo.toolUseId)"
+                )
+                logger.info(
+                    "📊 Current history state: \(fullConversationHistory.count) messages, last 3 roles: \(fullConversationHistory.suffix(3).map { $0.role.rawValue }.joined(separator: " -> "))"
+                )
 
-                await saveConversationHistory(conversationHistory)
+                // 完全な履歴を保存（要約されない）
+                await saveConversationHistory(fullConversationHistory)
 
-                // Create updated messages list - important to correctly map conversation to SDK messages
-                let updatedMessages = try conversationHistory.map {
-                    try convertToBedrockMessage($0, modelId: chatModel.id)
+                // Bedrock送信用に最適化
+                let optimizedHistoryForNextCycle = await manageConversationByCharacterCount(
+                    fullConversationHistory)
+
+                // Pre-validate before conversion to catch issues early
+                do {
+                    let testMessages = try optimizedHistoryForNextCycle.map {
+                        try convertToBedrockMessage($0, modelId: chatModel.id)
+                    }
+                    try validateMessageStructure(testMessages)
+                    logger.info("✅ Pre-validation passed for \(testMessages.count) messages")
+                } catch {
+                    logger.error("❌ Pre-validation failed: \(error)")
+                    // Use emergency cleanup
+                    logger.info("🚨 Activating emergency tool cleanup...")
+                    let cleanedHistory = await emergencyToolCleanup(optimizedHistoryForNextCycle)
+                    // emergencyToolCleanupは送信用のみに使用、保存はしない
+
+                    // 完全な履歴からツールをクリーンアップして保存
+                    let cleanedFullHistory = await emergencyToolCleanup(fullConversationHistory)
+                    await saveConversationHistory(cleanedFullHistory)
+                }
+
+                // Create updated messages for next cycle (最適化された履歴を使用)
+                let updatedMessages: [AWSBedrockRuntime.BedrockRuntimeClientTypes.Message]
+                do {
+                    updatedMessages = try optimizedHistoryForNextCycle.map {
+                        try convertToBedrockMessage($0, modelId: chatModel.id)
+                    }
+                    logger.info(
+                        "✅ Successfully converted \(updatedMessages.count) messages for next cycle")
+                } catch {
+                    logger.error("❌ Critical: Message conversion failed: \(error)")
+                    throw ToolUseError(
+                        message: "メッセージ変換エラー: \(error.localizedDescription). ツール使用を停止します。")
                 }
 
                 // Recursively continue with next turn
+                // CRITICAL FIX: メモリ上の最新履歴を引き継ぐ
                 try await processToolCycles(
                     bedrockMessages: updatedMessages,
                     systemContentBlock: systemContentBlock,
                     toolConfig: toolConfig,
                     turnCount: turnCount + 1,
-                    maxTurns: maxTurns
+                    maxTurns: maxTurns,
+                    currentFullHistory: fullConversationHistory
                 )
 
                 // End this turn's processing
@@ -1217,7 +1561,7 @@ class ChatViewModel: ObservableObject {
                     isError: false,
                     sentTime: Date()
                 )
-                addMessage(assistantMessage)
+                addUIOnlyMessage(assistantMessage)
             } else {
                 // Update the final message content - both UI and storage
                 updateMessageText(messageId: messageId, newText: assistantText)
@@ -1238,13 +1582,13 @@ class ChatViewModel: ObservableObject {
                                 text: thinking!,
                                 signature: thinkingSignature ?? UUID().uuidString
                             )),
-                        .text(assistantText),  // thinking 다음에 text가 오도록 순서 변경
+                        .text(assistantText),
                     ] : [.text(assistantText)]
             )
 
-            // Add to history and save
-            conversationHistory.append(assistantMsg)
-            await saveConversationHistory(conversationHistory)
+            // Add to full history and save (完全な履歴を保存)
+            fullConversationHistory.append(assistantMsg)
+            await saveConversationHistory(fullConversationHistory)
         }
 
         // Clear tracking of streaming message ID
@@ -1459,20 +1803,339 @@ class ChatViewModel: ObservableObject {
 
     // MARK: - Conversation History Management
 
-    /// Gets conversation history
+    /// Gets conversation history for storage (完全な履歴を返す - 保存用)
     private func getConversationHistory() async -> [BedrockMessage] {
+        var messages: [BedrockMessage] = []
+
         // Build conversation history from local storage
         if let history = chatManager.getConversationHistory(for: chatId) {
-            return convertConversationHistoryToBedrockMessages(history)
+            messages = convertConversationHistoryToBedrockMessages(history)
+        } else if chatManager.getMessages(for: chatId).count > 0 {
+            // Migrate from legacy formats if needed
+            messages = await migrateAndGetConversationHistory()
+        } else {
+            // No history exists
+            return []
         }
 
-        // Migrate from legacy formats if needed
-        if chatManager.getMessages(for: chatId).count > 0 {
-            return await migrateAndGetConversationHistory()
+        // NEW: ALWAYS remove consecutive duplicate messages before returning
+        return removeDuplicateConsecutiveBedrockMessages(messages)
+    }
+
+    /// Removes consecutive duplicate Bedrock messages (same role, same text)
+    /// This is the FINAL safety net before sending to API
+    private func removeDuplicateConsecutiveBedrockMessages(_ messages: [BedrockMessage])
+        -> [BedrockMessage]
+    {
+        guard messages.count > 1 else { return messages }
+
+        var cleaned: [BedrockMessage] = []
+        var previousMessage: BedrockMessage? = nil
+        var removedCount = 0
+
+        for message in messages {
+            // Check if this is a duplicate of the previous message
+            if let prev = previousMessage,
+                prev.role == message.role,
+                extractTextFromContents(prev.content) == extractTextFromContents(message.content)
+            {
+                // Skip this duplicate
+                removedCount += 1
+                logger.warning(
+                    "🔧 [FINAL SAFETY NET] Removing duplicate \(message.role) message: '\(extractTextFromContents(message.content).prefix(50))...'"
+                )
+                continue
+            }
+
+            cleaned.append(message)
+            previousMessage = message
         }
 
-        // No history exists
-        return []
+        if removedCount > 0 {
+            logger.info(
+                "🔧 [FINAL SAFETY NET] Removed \(removedCount) consecutive duplicate messages from history (\(messages.count) -> \(cleaned.count))"
+            )
+        }
+
+        return cleaned
+    }
+
+    /// Extracts text content from message contents for comparison
+    private func extractTextFromContents(_ contents: [MessageContent]) -> String {
+        var text = ""
+        for content in contents {
+            switch content {
+            case .text(let t):
+                text += t
+            default:
+                continue
+            }
+        }
+        return text.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Gets optimized conversation history for Bedrock API (最適化された履歴 - Bedrock送信用)
+    /// 10万文字を超える場合、直近10会話 + それ以前の要約を返す
+    private func getOptimizedConversationHistoryForBedrock() async -> [BedrockMessage] {
+        // 完全な履歴を取得
+        let fullHistory = await getConversationHistory()
+
+        // 文字数ベースで最適化
+        return await manageConversationByCharacterCount(fullHistory)
+    }
+
+    /// 文字数ベースでの会話履歴管理
+    /// 10万文字を超える場合、直近10会話 + それ以前の要約を生成
+    /// ⚠️ CRITICAL: ツールメッセージがある場合は要約をスキップ（順序保持のため）
+    private func manageConversationByCharacterCount(_ messages: [BedrockMessage]) async
+        -> [BedrockMessage]
+    {
+        guard messages.count > 10 else {
+            // 10会話以下の場合はそのまま返す
+            return messages
+        }
+
+        // CRITICAL FIX: ツールメッセージが含まれている場合は要約をスキップ
+        // 理由: ツールメッセージの順序を保持する必要があり、分離・再結合で順序が壊れる
+        let hasToolMessages = messages.contains { message in
+            message.content.contains { content in
+                switch content {
+                case .tooluse(_), .toolresult(_):
+                    return true
+                default:
+                    return false
+                }
+            }
+        }
+
+        if hasToolMessages {
+            logger.info("⚠️ ツールメッセージが含まれているため、要約をスキップして全履歴を使用")
+            return messages
+        }
+
+        // 全体の文字数をカウント
+        let totalCharacters = countCharactersInMessages(messages)
+
+        logger.info("会話履歴の総文字数: \(totalCharacters)文字 (\(messages.count)メッセージ)")
+
+        // 9万文字以下の場合はそのまま返す
+        if totalCharacters <= 90_000 {
+            logger.info("9万文字以下のため、全履歴を使用")
+            return messages
+        }
+
+        logger.info("⚠️ 9万文字超過 - 要約処理を開始")
+
+        // 通常メッセージのみから直近10会話を取得
+        let (recentMessages, olderMessages) = extractRecentMessagesSimple(
+            messages, recentCount: 10)
+
+        // 古いメッセージを要約
+        var optimizedHistory: [BedrockMessage] = []
+
+        if !olderMessages.isEmpty {
+            do {
+                let summary = try await summarizeOlderMessages(olderMessages)
+
+                // 要約メッセージを作成
+                let summaryMessage = BedrockMessage(
+                    role: .assistant,
+                    content: [.text("📋 **以前の会話の要約**\n\n\(summary)")]
+                )
+                optimizedHistory.append(summaryMessage)
+
+                logger.info("✅ 要約完了: \(olderMessages.count)メッセージ → 要約")
+
+            } catch {
+                logger.error("要約処理失敗: \(error.localizedDescription)")
+            }
+        }
+
+        // 直近メッセージを追加
+        optimizedHistory.append(contentsOf: recentMessages)
+
+        logger.info(
+            "✅ 最適化完了: 要約 + 直近\(recentMessages.count) = 合計\(optimizedHistory.count)メッセージ"
+        )
+
+        return optimizedHistory
+    }
+
+    /// メッセージ配列の総文字数をカウント
+    private func countCharactersInMessages(_ messages: [BedrockMessage]) -> Int {
+        var totalChars = 0
+
+        for message in messages {
+            for content in message.content {
+                switch content {
+                case .text(let text):
+                    totalChars += text.count
+                case .thinking(let thinking):
+                    totalChars += thinking.text.count
+                case .image(_):
+                    // 画像は約1000文字相当としてカウント
+                    totalChars += 1000
+                case .document(let doc):
+                    // ドキュメントは名前のみカウント（内容はbase64なので除外）
+                    totalChars += doc.name.count + 100
+                case .tooluse(let tool):
+                    totalChars += tool.name.count + 100
+                case .toolresult(let result):
+                    totalChars += result.result.count
+                }
+            }
+        }
+
+        return totalChars
+    }
+
+    /// 古いメッセージ群を要約
+    private func summarizeOlderMessages(_ messages: [BedrockMessage]) async throws -> String {
+        guard !messages.isEmpty else {
+            return ""
+        }
+
+        logger.info("古いメッセージの要約開始: \(messages.count)メッセージ")
+
+        // 会話履歴をテキスト形式に変換
+        var conversationText = ""
+
+        for (index, message) in messages.enumerated() {
+            let role = message.role == .user ? "User" : "Assistant"
+            conversationText += "\n--- メッセージ \(index + 1) ---\n"
+            conversationText += "\(role):\n"
+
+            for content in message.content {
+                switch content {
+                case .text(let text):
+                    conversationText += text + "\n"
+                case .thinking(let thinking):
+                    conversationText += "[思考]: \(thinking.text.prefix(200))...\n"
+                case .image(_):
+                    conversationText += "[画像が添付されました]\n"
+                case .document(let doc):
+                    conversationText += "[ドキュメント: \(doc.name)]\n"
+                case .tooluse(let tool):
+                    conversationText += "[ツール使用: \(tool.name)]\n"
+                case .toolresult(let result):
+                    conversationText += "[結果: \(result.result.prefix(100))...]\n"
+                }
+            }
+        }
+
+        // 要約用のプロンプト
+        let summaryPrompt = """
+            以下の会話履歴を簡潔に要約してください。
+
+            要約の方針：
+            1. 重要な質問と回答の要点を箇条書きで記載
+            2. 決定事項や結論を明確に記載
+            3. 技術的な詳細は必要最小限に
+            4. 全体の流れと文脈を保持
+            5. 5000文字以内に収める
+
+            会話履歴（\(messages.count)メッセージ）：
+            \(conversationText)
+
+            上記の会話を、重要な情報を失わずに簡潔にまとめてください。
+            """
+
+        // 要約リクエスト用のメッセージ
+        let summaryRequestMessage = BedrockMessage(
+            role: .user,
+            content: [.text(summaryPrompt)]
+        )
+
+        // AWS SDK形式に変換
+        let awsMessage = try convertToBedrockMessage(summaryRequestMessage, modelId: chatModel.id)
+
+        // 軽量モデルで要約（コスト削減）
+        // リージョンに応じて利用可能なモデルを選択
+        let summaryModelId = selectSummaryModel()
+
+        var summaryText = ""
+
+        // ストリーミングで要約を取得
+        for try await chunk in try await backendModel.backend.converseStream(
+            withId: summaryModelId,
+            messages: [awsMessage],
+            systemContent: [.text("あなたは会話要約の専門家です。与えられた会話履歴から重要な情報を抽出し、簡潔にまとめてください。")],
+            inferenceConfig: nil,
+            usageHandler: { [weak self] usage in
+                self?.logger.debug(
+                    "要約生成 - Input: \(usage.inputTokens ?? 0), Output: \(usage.outputTokens ?? 0)")
+            }
+        ) {
+            if let textChunk = extractTextFromChunk(chunk) {
+                summaryText += textChunk
+            }
+        }
+
+        let trimmedSummary = summaryText.trimmingCharacters(in: .whitespacesAndNewlines)
+        logger.info("要約生成完了: \(trimmedSummary.count)文字")
+
+        return trimmedSummary
+    }
+
+    /// ツールメッセージと通常メッセージを分離
+    /// ツールメッセージはtool_use/tool_resultペアとして保持し、要約処理から除外する
+    private func separateToolAndNonToolMessages(_ messages: [BedrockMessage])
+        -> (toolMessages: [BedrockMessage], nonToolMessages: [BedrockMessage])
+    {
+        var toolMessages: [BedrockMessage] = []
+        var nonToolMessages: [BedrockMessage] = []
+
+        for message in messages {
+            var hasToolContent = false
+
+            // メッセージにツール関連のコンテンツが含まれているかチェック
+            for content in message.content {
+                switch content {
+                case .tooluse(_), .toolresult(_):
+                    hasToolContent = true
+                default:
+                    continue
+                }
+            }
+
+            if hasToolContent {
+                toolMessages.append(message)
+            } else {
+                nonToolMessages.append(message)
+            }
+        }
+
+        return (toolMessages, nonToolMessages)
+    }
+
+    /// シンプルに直近メッセージを抽出（ツールメッセージが既に分離されているため）
+    private func extractRecentMessagesSimple(_ messages: [BedrockMessage], recentCount: Int)
+        -> (recent: [BedrockMessage], older: [BedrockMessage])
+    {
+        guard messages.count > recentCount else {
+            return (messages, [])
+        }
+
+        let splitIndex = messages.count - recentCount
+        let recent = Array(messages.suffix(from: splitIndex))
+        let older = Array(messages.prefix(splitIndex))
+
+        return (recent, older)
+    }
+
+    /// 要約生成用の軽量モデルを選択
+    private func selectSummaryModel() -> String {
+        // 利用可能なモデルの優先順位リスト
+        let preferredModels = [
+            chatModel.id,  // フォールバック: 現在のモデル
+            "amazon.nova-lite-v1:0",
+            "anthropic.claude-3-5-haiku-20241022-v1:0",
+            "anthropic.claude-3-haiku-20240307-v1:0",
+            "meta.llama3-1-8b-instruct-v1:0",
+        ]
+
+        // 最初のモデルを返す（実際の利用可能性チェックは省略）
+        return preferredModels.first ?? chatModel.id
     }
 
     /// Migrates from legacy formats and returns conversation history
@@ -1484,6 +2147,27 @@ class ChatViewModel: ObservableObject {
 
         for message in messages {
             let role: MessageRole = message.user == "User" ? .user : .assistant
+
+            // STRICT: For user tool_result messages, create ONLY tool_result block
+            // CRITICAL: Check this FIRST before processing any other content
+            if role == .user, let toolUse = message.toolUse, let toolResult = message.toolResult {
+                let bedrockMessage = BedrockMessage(
+                    role: role,
+                    content: [
+                        .toolresult(
+                            MessageContent.ToolResultContent(
+                                toolUseId: toolUse.id,
+                                result: toolResult,
+                                status: "success"
+                            ))
+                    ]
+                )
+                bedrockMessages.append(bedrockMessage)
+                logger.debug(
+                    "🔧 [Migration] Created STRICT tool_result-only user message for tool ID: \(toolUse.id)"
+                )
+                continue  // CRITICAL: Skip all other content processing for this message
+            }
 
             var contents: [MessageContent] = []
 
@@ -1536,33 +2220,21 @@ class ChatViewModel: ObservableObject {
                 }
             }
 
-            // Add tool info if present
-            if let toolUse = message.toolUse {
-                // For assistant, add as tooluse
-                if role == .assistant {
-                    contents.append(
-                        .tooluse(
-                            MessageContent.ToolUseContent(
-                                toolUseId: toolUse.id,
-                                name: toolUse.name,
-                                input: toolUse.input
-                            )))
-                }
-
-                // For tool results in user messages
-                if role == .user, let toolResult = message.toolResult {
-                    contents.append(
-                        .toolresult(
-                            MessageContent.ToolResultContent(
-                                toolUseId: toolUse.id,
-                                result: toolResult,
-                                status: "success"
-                            )))
-                }
+            // Add tool info if present (for assistant messages only)
+            if role == .assistant, let toolUse = message.toolUse {
+                contents.append(
+                    .tooluse(
+                        MessageContent.ToolUseContent(
+                            toolUseId: toolUse.id,
+                            name: toolUse.name,
+                            input: toolUse.input
+                        )))
             }
 
-            let bedrockMessage = BedrockMessage(role: role, content: contents)
-            bedrockMessages.append(bedrockMessage)
+            if !contents.isEmpty {
+                let bedrockMessage = BedrockMessage(role: role, content: contents)
+                bedrockMessages.append(bedrockMessage)
+            }
         }
 
         // Save newly converted history
@@ -1641,8 +2313,16 @@ class ChatViewModel: ObservableObject {
                     }
 
                 case .toolresult(let tr):
-                    // If this is a user message with toolResult, simply extract the result text
+                    // If this is a user message with toolResult, extract the result text
                     if bedrockMessage.role == .user {
+                        // CRITICAL FIX: Use unique text for each tool_result to prevent duplicate consecutive messages
+                        // Include tool ID and truncated result to make each message unique
+                        if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                            let resultPreview = tr.result.prefix(50).trimmingCharacters(
+                                in: .whitespacesAndNewlines)
+                            text = "Tool[\(tr.toolUseId.suffix(8))]: \(resultPreview)"
+                        }
+
                         toolUseForStorage = Message.ToolUse(
                             toolId: tr.toolUseId,
                             toolName: "",
@@ -1695,6 +2375,23 @@ class ChatViewModel: ObservableObject {
 
             var contents: [MessageContent] = []
 
+            // STRICT: For user tool_result messages, include ONLY tool_result (no other blocks)
+            // CRITICAL: Check this FIRST before processing any other content
+            if role == .user, let tu = message.toolUse, let result = tu.result {
+                contents = [
+                    .toolresult(
+                        .init(
+                            toolUseId: tu.toolId,
+                            result: result,
+                            status: "success"
+                        ))
+                ]
+                bedrockMessages.append(BedrockMessage(role: role, content: contents))
+                logger.debug(
+                    "🔧 Created STRICT tool_result-only user message for tool ID: \(tu.toolId)")
+                continue  // CRITICAL: Skip all other content processing for this message
+            }
+
             // Add thinking content if present for assistant messages
             // Skip thinking content for OpenAI models as they don't support signature field
             if role == .assistant, let thinking = message.thinking, !thinking.isEmpty,
@@ -1743,7 +2440,8 @@ class ChatViewModel: ObservableObject {
                 }
             }
 
-            // Handle Tool Use/Result
+            // Handle Tool Use for assistant messages only
+            // CRITICAL: User tool_result messages are handled separately above
             if role == .assistant, let toolUse = message.toolUse {
                 contents.append(
                     .tooluse(
@@ -1752,20 +2450,730 @@ class ChatViewModel: ObservableObject {
                             name: toolUse.toolName,
                             input: toolUse.inputs
                         )))
-            } else if role == .user, let toolUse = message.toolUse, let result = toolUse.result {
-                contents.append(
-                    .toolresult(
-                        .init(
-                            toolUseId: toolUse.toolId,
-                            result: result,
-                            status: "success"
-                        )))
             }
 
-            bedrockMessages.append(BedrockMessage(role: role, content: contents))
+            // Only add message if it has content
+            if !contents.isEmpty {
+                bedrockMessages.append(BedrockMessage(role: role, content: contents))
+            } else {
+                logger.warning(
+                    "⚠️ Skipping message with no content after processing: role=\(role)")
+            }
         }
 
         return bedrockMessages
+    }
+
+    // MARK: - Validation and Cleanup Functions
+
+    /// Validates message structure before sending to AWS Bedrock API
+    /// CRITICAL: AWS Bedrock requires EXACT pairing of assistant(tool_use) -> user(tool_result)
+    private func validateMessageStructure(
+        _ messages: [AWSBedrockRuntime.BedrockRuntimeClientTypes.Message]
+    ) throws {
+        var toolUseCount = 0
+        var toolResultCount = 0
+        var toolUseIds: Set<String> = []
+        var toolResultIds: Set<String> = []
+
+        // NEW: Track message-level tool_use positions for strict ordering validation
+        var toolUsePositions:
+            [(
+                index: Int, role: AWSBedrockRuntime.BedrockRuntimeClientTypes.ConversationRole,
+                id: String
+            )] = []
+        var toolResultPositions:
+            [(
+                index: Int, role: AWSBedrockRuntime.BedrockRuntimeClientTypes.ConversationRole,
+                id: String
+            )] = []
+
+        for (messageIndex, message) in messages.enumerated() {
+            for content in message.content ?? [] {
+                switch content {
+                case .tooluse(let toolUse):
+                    if let toolUseId = toolUse.toolUseId {
+                        toolUseCount += 1
+                        toolUseIds.insert(toolUseId)
+                        toolUsePositions.append(
+                            (index: messageIndex, role: message.role ?? .user, id: toolUseId))
+                    }
+                case .toolresult(let toolResult):
+                    if let toolUseId = toolResult.toolUseId {
+                        toolResultCount += 1
+                        toolResultIds.insert(toolUseId)
+                        toolResultPositions.append(
+                            (index: messageIndex, role: message.role ?? .user, id: toolUseId))
+                    }
+                default:
+                    continue
+                }
+            }
+        }
+
+        // Check for orphaned tool_use or tool_result
+        let orphanedToolUse = toolUseIds.subtracting(toolResultIds)
+        let orphanedToolResult = toolResultIds.subtracting(toolUseIds)
+
+        if !orphanedToolUse.isEmpty || !orphanedToolResult.isEmpty {
+            var errorMessage = "❌ Tool pair validation failed:"
+            if !orphanedToolUse.isEmpty {
+                errorMessage +=
+                    "\n  Missing tool_result for tool_use IDs: \(orphanedToolUse.joined(separator: ", "))"
+            }
+            if !orphanedToolResult.isEmpty {
+                errorMessage +=
+                    "\n  Missing tool_use for tool_result IDs: \(orphanedToolResult.joined(separator: ", "))"
+            }
+
+            // NEW: Add detailed diagnostic information
+            errorMessage += "\n\n📊 Diagnostic Info:"
+            errorMessage += "\n  Total messages: \(messages.count)"
+            errorMessage += "\n  Tool uses found: \(toolUseCount)"
+            errorMessage += "\n  Tool results found: \(toolResultCount)"
+
+            if !toolUsePositions.isEmpty {
+                errorMessage += "\n\n  Tool use positions:"
+                for pos in toolUsePositions {
+                    errorMessage += "\n    - Message[\(pos.index)] (\(pos.role)): \(pos.id)"
+                }
+            }
+
+            if !toolResultPositions.isEmpty {
+                errorMessage += "\n\n  Tool result positions:"
+                for pos in toolResultPositions {
+                    errorMessage += "\n    - Message[\(pos.index)] (\(pos.role)): \(pos.id)"
+                }
+            }
+
+            throw ToolUseError(message: errorMessage)
+        }
+
+        // NEW: Strict ordering validation - each tool_use must be immediately followed by tool_result
+        for toolUsePos in toolUsePositions {
+            // Find the corresponding tool_result
+            if let resultPos = toolResultPositions.first(where: { $0.id == toolUsePos.id }) {
+                // Verify strict ordering: tool_use must be in assistant message, result in user message
+                if toolUsePos.role != .assistant {
+                    throw ToolUseError(
+                        message:
+                            "❌ Tool use '\(toolUsePos.id)' at message[\(toolUsePos.index)] must be in assistant message, but found in \(toolUsePos.role) message"
+                    )
+                }
+
+                if resultPos.role != .user {
+                    throw ToolUseError(
+                        message:
+                            "❌ Tool result '\(resultPos.id)' at message[\(resultPos.index)] must be in user message, but found in \(resultPos.role) message"
+                    )
+                }
+
+                // Verify tool_result comes after tool_use (not necessarily immediately after due to other messages)
+                if resultPos.index <= toolUsePos.index {
+                    throw ToolUseError(
+                        message:
+                            "❌ Tool result '\(resultPos.id)' at message[\(resultPos.index)] must come AFTER tool use at message[\(toolUsePos.index)]"
+                    )
+                }
+            }
+        }
+
+        logger.info(
+            "✅ Message structure validation passed: \(toolUseCount) tool_use, \(toolResultCount) tool_result, strict ordering verified"
+        )
+
+        // NEW: Validate alternating user/assistant pattern (AWS Bedrock requirement)
+        try validateAlternatingRoles(messages)
+    }
+
+    /// Sanitizes messages to fix common issues before sending to AWS Bedrock
+    /// Automatically fixes: consecutive same-role messages, duplicate messages, empty messages, orphaned tool_use
+    private func sanitizeMessages(
+        _ messages: [AWSBedrockRuntime.BedrockRuntimeClientTypes.Message]
+    ) -> [AWSBedrockRuntime.BedrockRuntimeClientTypes.Message] {
+        guard !messages.isEmpty else { return messages }
+
+        var sanitized: [AWSBedrockRuntime.BedrockRuntimeClientTypes.Message] = []
+        var previousRole: AWSBedrockRuntime.BedrockRuntimeClientTypes.ConversationRole? = nil
+        var accumulatedContent: [AWSBedrockRuntime.BedrockRuntimeClientTypes.ContentBlock] = []
+        var currentRole: AWSBedrockRuntime.BedrockRuntimeClientTypes.ConversationRole = .user
+        var fixCount = 0
+        var previousUserText: String? = nil
+
+        for (index, message) in messages.enumerated() {
+            let role = message.role ?? .user
+            let content = message.content ?? []
+
+            // Skip messages with no content
+            if content.isEmpty {
+                logger.warning("🔧 Sanitize: Skipping empty message at index \(index)")
+                fixCount += 1
+                continue
+            }
+
+            // NEW: Check for duplicate consecutive user messages with same text content
+            if role == .user {
+                let textContent = extractTextFromAWSContentBlocks(content)
+                if let prevText = previousUserText, prevText == textContent, !textContent.isEmpty {
+                    logger.warning(
+                        "🔧 Sanitize: Skipping duplicate consecutive user message at index \(index): '\(textContent.prefix(50))...'"
+                    )
+                    fixCount += 1
+                    continue
+                }
+                previousUserText = textContent
+            } else {
+                previousUserText = nil
+            }
+
+            // Check if this is a consecutive same-role message
+            if let prevRole = previousRole, prevRole == role {
+                // Merge content into accumulated content
+                logger.info("🔧 Sanitize: Merging consecutive \(role) message at index \(index)")
+                accumulatedContent.append(contentsOf: content)
+                fixCount += 1
+                continue
+            }
+
+            // If we have accumulated content, create a merged message
+            if !accumulatedContent.isEmpty {
+                let mergedMessage = AWSBedrockRuntime.BedrockRuntimeClientTypes.Message(
+                    content: accumulatedContent,
+                    role: currentRole
+                )
+                sanitized.append(mergedMessage)
+                accumulatedContent = []
+            }
+
+            // Start accumulating new content
+            currentRole = role
+            accumulatedContent = content
+            previousRole = role
+        }
+
+        // Add any remaining accumulated content
+        if !accumulatedContent.isEmpty {
+            let finalMessage = AWSBedrockRuntime.BedrockRuntimeClientTypes.Message(
+                content: accumulatedContent,
+                role: currentRole
+            )
+            sanitized.append(finalMessage)
+        }
+
+        if fixCount > 0 {
+            logger.info(
+                "🔧 Sanitize: Fixed \(fixCount) issues, \(messages.count) -> \(sanitized.count) messages"
+            )
+        }
+
+        // NEW: Remove orphaned tool_use blocks (tool_use without immediate tool_result)
+        let toolCleaned = removeOrphanedToolUseBlocks(sanitized)
+
+        // Final check: Ensure we start with user and alternate properly
+        return ensureProperStartRole(toolCleaned)
+    }
+
+    // NEW: Strict sanitizer that does NOT merge across tool_use/tool_result boundaries
+    private func sanitizeMessagesStrict(
+        _ messages: [AWSBedrockRuntime.BedrockRuntimeClientTypes.Message]
+    ) -> [AWSBedrockRuntime.BedrockRuntimeClientTypes.Message] {
+        guard !messages.isEmpty else { return messages }
+
+        var sanitized: [AWSBedrockRuntime.BedrockRuntimeClientTypes.Message] = []
+        var accumulationRole: AWSBedrockRuntime.BedrockRuntimeClientTypes.ConversationRole? = nil
+        var accumulationContent: [AWSBedrockRuntime.BedrockRuntimeClientTypes.ContentBlock] = []
+        var accumulationHasTool = false
+        var fixCount = 0
+        var previousUserText: String? = nil
+
+        func hasToolBlocks(_ blocks: [AWSBedrockRuntime.BedrockRuntimeClientTypes.ContentBlock])
+            -> Bool
+        {
+            for block in blocks {
+                switch block {
+                case .tooluse(_), .toolresult(_):
+                    return true
+                default:
+                    continue
+                }
+            }
+            return false
+        }
+
+        for (index, message) in messages.enumerated() {
+            let role = message.role ?? .user
+            let content = message.content ?? []
+
+            // Skip empty messages
+            if content.isEmpty {
+                logger.warning("🔧 SanitizeStrict: Skipping empty message at index \(index)")
+                fixCount += 1
+                continue
+            }
+
+            // Skip duplicate consecutive user text-only messages (ignore tool_result-only messages)
+            if role == .user {
+                let textContent = extractTextFromAWSContentBlocks(content)
+                if let prev = previousUserText, prev == textContent, !textContent.isEmpty {
+                    logger.warning(
+                        "🔧 SanitizeStrict: Skipping duplicate consecutive user message at index \(index): '\(textContent.prefix(50))...'"
+                    )
+                    fixCount += 1
+                    continue
+                }
+                previousUserText = textContent
+            } else {
+                previousUserText = nil
+            }
+
+            let currentHasTool = hasToolBlocks(content)
+
+            if let accRole = accumulationRole,
+                accRole == role,
+                !accumulationHasTool,
+                !currentHasTool
+            {
+                // Safe to merge (no tool blocks involved)
+                accumulationContent.append(contentsOf: content)
+                fixCount += 1
+            } else {
+                // Flush previous accumulation if any
+                if let accRole = accumulationRole, !accumulationContent.isEmpty {
+                    sanitized.append(
+                        AWSBedrockRuntime.BedrockRuntimeClientTypes.Message(
+                            content: accumulationContent,
+                            role: accRole
+                        )
+                    )
+                }
+                // Start new accumulation
+                accumulationRole = role
+                accumulationContent = content
+                accumulationHasTool = currentHasTool
+            }
+        }
+
+        // Flush remainder
+        if let accRole = accumulationRole, !accumulationContent.isEmpty {
+            sanitized.append(
+                AWSBedrockRuntime.BedrockRuntimeClientTypes.Message(
+                    content: accumulationContent,
+                    role: accRole
+                )
+            )
+        }
+
+        if fixCount > 0 {
+            logger.info(
+                "🔧 SanitizeStrict: Fixed \(fixCount) issues, \(messages.count) -> \(sanitized.count) messages (no tool-boundary merges)"
+            )
+        }
+
+        // Remove orphaned tool_use and ensure proper start role
+        let toolCleaned = removeOrphanedToolUseBlocks(sanitized)
+        return ensureProperStartRole(toolCleaned)
+    }
+
+    /// Extracts text content from AWS ContentBlock array for comparison
+    private func extractTextFromAWSContentBlocks(
+        _ blocks: [AWSBedrockRuntime.BedrockRuntimeClientTypes.ContentBlock]
+    ) -> String {
+        var text = ""
+        for block in blocks {
+            if case .text(let t) = block {
+                text += t
+            }
+        }
+        return text.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Removes orphaned tool_use blocks that don't have corresponding tool_result in the next user message
+    /// This prevents ValidationException: "tool_use ids were found without tool_result blocks immediately after"
+    private func removeOrphanedToolUseBlocks(
+        _ messages: [AWSBedrockRuntime.BedrockRuntimeClientTypes.Message]
+    ) -> [AWSBedrockRuntime.BedrockRuntimeClientTypes.Message] {
+        guard messages.count > 1 else { return messages }
+
+        var cleaned: [AWSBedrockRuntime.BedrockRuntimeClientTypes.Message] = []
+        var orphanedToolUseCount = 0
+
+        for i in 0..<messages.count {
+            let message = messages[i]
+            let role = message.role ?? .user
+            var content = message.content ?? []
+
+            // If this is an assistant message, check for tool_use blocks
+            if role == .assistant {
+                // Extract tool_use IDs from this message
+                var toolUseIds: Set<String> = []
+                for block in content {
+                    if case .tooluse(let toolUse) = block, let toolUseId = toolUse.toolUseId {
+                        toolUseIds.insert(toolUseId)
+                    }
+                }
+
+                // If we have tool_use blocks, check if the next message has corresponding tool_result
+                if !toolUseIds.isEmpty && i + 1 < messages.count {
+                    let nextMessage = messages[i + 1]
+                    let nextRole = nextMessage.role ?? .user
+
+                    // Next message should be user with tool_result
+                    if nextRole == .user {
+                        // Extract tool_result IDs from next message
+                        var toolResultIds: Set<String> = []
+                        for block in nextMessage.content ?? [] {
+                            if case .toolresult(let toolResult) = block,
+                                let toolUseId = toolResult.toolUseId
+                            {
+                                toolResultIds.insert(toolUseId)
+                            }
+                        }
+
+                        // Find orphaned tool_use IDs (those without corresponding tool_result)
+                        let orphanedIds = toolUseIds.subtracting(toolResultIds)
+
+                        if !orphanedIds.isEmpty {
+                            // Remove orphaned tool_use blocks from content
+                            content = content.filter { block in
+                                if case .tooluse(let toolUse) = block,
+                                    let toolUseId = toolUse.toolUseId,
+                                    orphanedIds.contains(toolUseId)
+                                {
+                                    logger.warning(
+                                        "🔧 Sanitize: Removing orphaned tool_use block with ID: \(toolUseId)"
+                                    )
+                                    orphanedToolUseCount += 1
+                                    return false
+                                }
+                                return true
+                            }
+                        }
+                    } else {
+                        // Next message is not user, remove all tool_use blocks
+                        let originalCount = content.count
+                        content = content.filter { block in
+                            if case .tooluse(let toolUse) = block {
+                                if let toolUseId = toolUse.toolUseId {
+                                    logger.warning(
+                                        "🔧 Sanitize: Removing tool_use block (next message not user) with ID: \(toolUseId)"
+                                    )
+                                }
+                                orphanedToolUseCount += 1
+                                return false
+                            }
+                            return true
+                        }
+                        if content.count < originalCount {
+                            logger.warning(
+                                "🔧 Sanitize: Removed \(originalCount - content.count) tool_use blocks (next message not user)"
+                            )
+                        }
+                    }
+                } else if !toolUseIds.isEmpty {
+                    // No next message, remove all tool_use blocks
+                    let originalCount = content.count
+                    content = content.filter { block in
+                        if case .tooluse(let toolUse) = block {
+                            if let toolUseId = toolUse.toolUseId {
+                                logger.warning(
+                                    "🔧 Sanitize: Removing tool_use block (no next message) with ID: \(toolUseId)"
+                                )
+                            }
+                            orphanedToolUseCount += 1
+                            return false
+                        }
+                        return true
+                    }
+                    if content.count < originalCount {
+                        logger.warning(
+                            "🔧 Sanitize: Removed \(originalCount - content.count) tool_use blocks (no next message)"
+                        )
+                    }
+                }
+            }
+
+            // Only add message if it has content after cleaning
+            if !content.isEmpty {
+                cleaned.append(
+                    AWSBedrockRuntime.BedrockRuntimeClientTypes.Message(
+                        content: content,
+                        role: role
+                    ))
+            } else if role == .assistant {
+                // If assistant message has no content after removing tool_use, add a placeholder
+                logger.warning(
+                    "🔧 Sanitize: Assistant message became empty after tool_use removal, adding placeholder"
+                )
+                cleaned.append(
+                    AWSBedrockRuntime.BedrockRuntimeClientTypes.Message(
+                        content: [.text("Processing your request...")],
+                        role: role
+                    ))
+            }
+        }
+
+        if orphanedToolUseCount > 0 {
+            logger.info(
+                "🔧 Sanitize: Removed \(orphanedToolUseCount) orphaned tool_use blocks to prevent ValidationException"
+            )
+        }
+
+        return cleaned
+    }
+
+    /// Ensures messages start with user role and maintain alternation
+    private func ensureProperStartRole(
+        _ messages: [AWSBedrockRuntime.BedrockRuntimeClientTypes.Message]
+    ) -> [AWSBedrockRuntime.BedrockRuntimeClientTypes.Message] {
+        guard !messages.isEmpty else { return messages }
+
+        // Check if first message is user
+        if let firstRole = messages.first?.role, firstRole == .user {
+            return messages
+        }
+
+        // First message is assistant, insert a dummy user message
+        logger.warning("🔧 Sanitize: First message is not user, inserting dummy user message")
+
+        let dummyUserMessage = AWSBedrockRuntime.BedrockRuntimeClientTypes.Message(
+            content: [.text("Continue from previous conversation")],
+            role: .user
+        )
+
+        return [dummyUserMessage] + messages
+    }
+
+    /// Validates that messages alternate between user and assistant roles
+    /// AWS Bedrock REQUIRES strict alternating pattern: user -> assistant -> user -> assistant
+    private func validateAlternatingRoles(
+        _ messages: [AWSBedrockRuntime.BedrockRuntimeClientTypes.Message]
+    ) throws {
+        guard messages.count > 1 else { return }
+
+        var previousRole: AWSBedrockRuntime.BedrockRuntimeClientTypes.ConversationRole? = nil
+        var consecutiveRoleViolations:
+            [(index: Int, role: AWSBedrockRuntime.BedrockRuntimeClientTypes.ConversationRole)] = []
+
+        for (index, message) in messages.enumerated() {
+            let currentRole = message.role ?? .user
+
+            if let prevRole = previousRole, prevRole == currentRole {
+                // Found consecutive same-role messages
+                consecutiveRoleViolations.append((index: index, role: currentRole))
+            }
+
+            previousRole = currentRole
+        }
+
+        if !consecutiveRoleViolations.isEmpty {
+            var errorMessage =
+                "❌ Role alternation validation failed: AWS Bedrock requires strict user <-> assistant alternation"
+            errorMessage += "\n\n🚨 Consecutive same-role messages detected:"
+
+            for violation in consecutiveRoleViolations {
+                errorMessage +=
+                    "\n  - Message[\(violation.index)]: \(violation.role) (previous message also \(violation.role))"
+            }
+
+            errorMessage += "\n\n📊 Message role sequence:"
+            for (index, message) in messages.enumerated() {
+                let role = message.role ?? .user
+                let marker =
+                    consecutiveRoleViolations.contains(where: { $0.index == index }) ? " ⚠️" : ""
+                errorMessage += "\n  [\(index)]: \(role)\(marker)"
+            }
+
+            throw ToolUseError(message: errorMessage)
+        }
+
+        logger.info("✅ Role alternation validation passed: All messages alternate correctly")
+    }
+
+    /// Creates optimal content order for AWS Bedrock API compatibility
+    private func createOptimalContentOrder(
+        text: String,
+        thinking: String?,
+        thinkingSignature: String?,
+        toolUse: MessageContent.ToolUseContent,
+        modelId: String
+    ) -> [MessageContent] {
+        var contents: [MessageContent] = []
+
+        // For reasoning-capable models, add thinking first if available
+        if let thinking = thinking, let signature = thinkingSignature,
+            !isDeepSeekModel(modelId) && !isOpenAIModel(modelId)
+        {
+            contents.append(
+                .thinking(MessageContent.ThinkingContent(text: thinking, signature: signature)))
+        }
+
+        // Add text content
+        contents.append(.text(text))
+
+        // Add tool use last
+        contents.append(.tooluse(toolUse))
+
+        return contents
+    }
+
+    /// Validates tool pairs in conversation history
+    private func validateToolPairs(in history: [BedrockMessage]) throws {
+        var toolUseIds: Set<String> = []
+        var toolResultIds: Set<String> = []
+
+        for message in history {
+            for content in message.content {
+                switch content {
+                case .tooluse(let toolUse):
+                    toolUseIds.insert(toolUse.toolUseId)
+                case .toolresult(let toolResult):
+                    toolResultIds.insert(toolResult.toolUseId)
+                default:
+                    continue
+                }
+            }
+        }
+
+        let orphanedToolUse = toolUseIds.subtracting(toolResultIds)
+        let orphanedToolResult = toolResultIds.subtracting(toolUseIds)
+
+        if !orphanedToolUse.isEmpty || !orphanedToolResult.isEmpty {
+            var errorMessage = "Tool pair validation failed in conversation history:"
+            if !orphanedToolUse.isEmpty {
+                errorMessage +=
+                    " Missing tool_result for IDs: \(orphanedToolUse.joined(separator: ", "))"
+            }
+            if !orphanedToolResult.isEmpty {
+                errorMessage +=
+                    " Missing tool_use for IDs: \(orphanedToolResult.joined(separator: ", "))"
+            }
+            throw ToolUseError(message: errorMessage)
+        }
+    }
+
+    /// Cleans up broken tool pairs from conversation history
+    private func cleanupBrokenToolPairs(_ history: [BedrockMessage]) -> [BedrockMessage] {
+        var cleanedHistory: [BedrockMessage] = []
+        var validToolIds: Set<String> = []
+
+        // First pass: identify valid tool pairs
+        var toolUseIds: Set<String> = []
+        var toolResultIds: Set<String> = []
+
+        for message in history {
+            for content in message.content {
+                switch content {
+                case .tooluse(let toolUse):
+                    toolUseIds.insert(toolUse.toolUseId)
+                case .toolresult(let toolResult):
+                    toolResultIds.insert(toolResult.toolUseId)
+                default:
+                    continue
+                }
+            }
+        }
+
+        // Only keep tool IDs that have both tool_use and tool_result
+        validToolIds = toolUseIds.intersection(toolResultIds)
+
+        // Second pass: rebuild history with only valid tool pairs
+        for message in history {
+            var cleanedContent: [MessageContent] = []
+
+            for content in message.content {
+                switch content {
+                case .tooluse(let toolUse):
+                    if validToolIds.contains(toolUse.toolUseId) {
+                        cleanedContent.append(content)
+                    } else {
+                        logger.warning("Removing orphaned tool_use: \(toolUse.toolUseId)")
+                    }
+                case .toolresult(let toolResult):
+                    if validToolIds.contains(toolResult.toolUseId) {
+                        cleanedContent.append(content)
+                    } else {
+                        logger.warning("Removing orphaned tool_result: \(toolResult.toolUseId)")
+                    }
+                default:
+                    cleanedContent.append(content)
+                }
+            }
+
+            // Only add message if it has content
+            if !cleanedContent.isEmpty {
+                cleanedHistory.append(BedrockMessage(role: message.role, content: cleanedContent))
+            }
+        }
+
+        logger.info("Cleaned up tool pairs: \(history.count) -> \(cleanedHistory.count) messages")
+        return cleanedHistory
+    }
+
+    /// Creates minimal tool use message content in AWS Bedrock API compliant format
+    /// STRICT: Assistant message must contain ONLY tool_use block to ensure the next message is user(tool_result)
+    private func createMinimalToolUseMessage(
+        text: String,
+        thinking: String?,
+        thinkingSignature: String?,
+        toolUse: MessageContent.ToolUseContent,
+        modelId: String
+    ) -> [MessageContent] {
+        // Return tool_use ONLY to satisfy "immediately after" constraint strictly
+        return [.tooluse(toolUse)]
+    }
+
+    /// Emergency tool cleanup that removes ALL tool-related content from conversation history
+    private func emergencyToolCleanup(_ history: [BedrockMessage]) async -> [BedrockMessage] {
+        logger.warning(
+            "🚨 EMERGENCY: Performing complete tool cleanup to prevent ValidationException")
+
+        var cleanedHistory: [BedrockMessage] = []
+
+        for message in history {
+            var cleanedContent: [MessageContent] = []
+
+            // Keep only non-tool content
+            for content in message.content {
+                switch content {
+                case .text(let text):
+                    cleanedContent.append(.text(text))
+                case .thinking(let thinking):
+                    // Keep thinking for supported models
+                    if !isDeepSeekModel(chatModel.id) && !isOpenAIModel(chatModel.id) {
+                        cleanedContent.append(.thinking(thinking))
+                    }
+                case .image(let image):
+                    cleanedContent.append(.image(image))
+                case .document(let document):
+                    cleanedContent.append(.document(document))
+                case .tooluse(_):
+                    // REMOVE all tool_use content
+                    logger.warning("🚨 Emergency: Removing tool_use content")
+                case .toolresult(_):
+                    // REMOVE all tool_result content
+                    logger.warning("🚨 Emergency: Removing tool_result content")
+                }
+            }
+
+            // Only add message if it has meaningful content
+            if !cleanedContent.isEmpty {
+                cleanedHistory.append(BedrockMessage(role: message.role, content: cleanedContent))
+            } else {
+                // Add a placeholder text message if no content remains
+                cleanedHistory.append(
+                    BedrockMessage(
+                        role: message.role,
+                        content: [
+                            .text(message.role == .user ? "Previous request" : "Previous response")
+                        ]
+                    ))
+            }
+        }
+
+        logger.warning(
+            "🚨 Emergency cleanup completed: \(history.count) -> \(cleanedHistory.count) messages, ALL tools removed"
+        )
+        return cleanedHistory
     }
 
     // MARK: - Utility Functions
@@ -1809,36 +3217,59 @@ class ChatViewModel: ObservableObject {
         return (text, signature)
     }
 
-    /// Converts a BedrockMessage to AWS SDK format
+    /// Converts a BedrockMessage to AWS SDK format with enhanced validation
     private func convertToBedrockMessage(_ message: BedrockMessage, modelId: String = "") throws
         -> AWSBedrockRuntime.BedrockRuntimeClientTypes.Message
     {
         var contentBlocks: [AWSBedrockRuntime.BedrockRuntimeClientTypes.ContentBlock] = []
+        var debugInfo: [String] = []
 
-        // Process all content blocks in their original order (no reordering!)
-        for content in message.content {
+        // Log the original message structure for debugging
+        logger.debug(
+            "🔍 Converting message with \(message.content.count) content blocks, role: \(message.role)"
+        )
+
+        // Process all content blocks with enhanced error handling
+        for (index, content) in message.content.enumerated() {
             switch content {
             case .text(let text):
-                contentBlocks.append(.text(text))
+                // CRITICAL FIX: Skip empty or whitespace-only text blocks as they cause ValidationException
+                let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmedText.isEmpty {
+                    contentBlocks.append(.text(trimmedText))
+                    debugInfo.append("text[\(index)]")
+                } else {
+                    logger.warning("🚨 Skipping empty text block at index \(index)")
+                }
 
             case .thinking(let thinkingContent):
                 // Skip reasoning content for user messages
                 // Also skip for DeepSeek models due to a server-side validation error
                 // Also skip for OpenAI models that don't support signature field
                 if message.role == .user || isDeepSeekModel(modelId) || isOpenAIModel(modelId) {
+                    logger.debug("Skipping thinking block for \(message.role) or unsupported model")
                     continue
                 }
 
-                // Add thinking content as a reasoning block
-                let reasoningTextBlock = AWSBedrockRuntime.BedrockRuntimeClientTypes
-                    .ReasoningTextBlock(
-                        signature: thinkingContent.signature,
-                        text: thinkingContent.text
+                // CRITICAL FIX: Validate thinking content before processing
+                let trimmedThinking = thinkingContent.text.trimmingCharacters(
+                    in: .whitespacesAndNewlines)
+                if !trimmedThinking.isEmpty && !thinkingContent.signature.isEmpty {
+                    let reasoningTextBlock = AWSBedrockRuntime.BedrockRuntimeClientTypes
+                        .ReasoningTextBlock(
+                            signature: thinkingContent.signature,
+                            text: trimmedThinking
+                        )
+                    contentBlocks.append(.reasoningcontent(.reasoningtext(reasoningTextBlock)))
+                    debugInfo.append("thinking[\(index)]")
+                } else {
+                    logger.warning(
+                        "🚨 Skipping invalid thinking block at index \(index): empty text or signature"
                     )
-                contentBlocks.append(.reasoningcontent(.reasoningtext(reasoningTextBlock)))
+                }
 
             case .image(let imageContent):
-                // Convert to AWS image format
+                // Convert to AWS image format with validation
                 let awsFormat: AWSBedrockRuntime.BedrockRuntimeClientTypes.ImageFormat
                 switch imageContent.format {
                 case .jpeg: awsFormat = .jpeg
@@ -1847,13 +3278,13 @@ class ChatViewModel: ObservableObject {
                 case .webp: awsFormat = .png  // Fall back to PNG for WebP
                 }
 
-                guard let imageData = Data(base64Encoded: imageContent.base64Data) else {
-                    logger.error("Failed to decode image base64 string")
-                    throw NSError(
-                        domain: "ChatViewModel", code: -1,
-                        userInfo: [
-                            NSLocalizedDescriptionKey: "Failed to decode base64 image to data"
-                        ])
+                // CRITICAL FIX: Enhanced base64 validation
+                guard !imageContent.base64Data.isEmpty,
+                    let imageData = Data(base64Encoded: imageContent.base64Data),
+                    !imageData.isEmpty
+                else {
+                    logger.error("🚨 Invalid image data at index \(index), skipping")
+                    continue
                 }
 
                 contentBlocks.append(
@@ -1862,9 +3293,10 @@ class ChatViewModel: ObservableObject {
                             format: awsFormat,
                             source: .bytes(imageData)
                         )))
+                debugInfo.append("image[\(index)]")
 
             case .document(let documentContent):
-                // Convert to AWS document format
+                // Convert to AWS document format with validation
                 let docFormat: AWSBedrockRuntime.BedrockRuntimeClientTypes.DocumentFormat
 
                 switch documentContent.format {
@@ -1879,62 +3311,117 @@ class ChatViewModel: ObservableObject {
                 case .md: docFormat = .md
                 }
 
-                guard let documentData = Data(base64Encoded: documentContent.base64Data) else {
-                    logger.error("Failed to decode document base64 string")
-                    throw NSError(
-                        domain: "ChatViewModel", code: -1,
-                        userInfo: [
-                            NSLocalizedDescriptionKey: "Failed to decode base64 document to data"
-                        ])
+                // CRITICAL FIX: Enhanced document validation
+                guard !documentContent.base64Data.isEmpty,
+                    !documentContent.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                    let documentData = Data(base64Encoded: documentContent.base64Data),
+                    !documentData.isEmpty
+                else {
+                    logger.error("🚨 Invalid document data at index \(index), skipping")
+                    continue
                 }
 
                 contentBlocks.append(
                     .document(
                         AWSBedrockRuntime.BedrockRuntimeClientTypes.DocumentBlock(
                             format: docFormat,
-                            name: documentContent.name,
+                            name: documentContent.name.trimmingCharacters(
+                                in: .whitespacesAndNewlines),
                             source: .bytes(documentData)
                         )))
+                debugInfo.append("document[\(index)]")
 
             case .toolresult(let toolResultContent):
+                // CRITICAL FIX: Enhanced tool result validation
+                let trimmedResult = toolResultContent.result.trimmingCharacters(
+                    in: .whitespacesAndNewlines)
+                let trimmedToolUseId = toolResultContent.toolUseId.trimmingCharacters(
+                    in: .whitespacesAndNewlines)
+
+                guard !trimmedResult.isEmpty && !trimmedToolUseId.isEmpty else {
+                    logger.error(
+                        "🚨 Invalid tool result at index \(index): empty result or toolUseId, skipping"
+                    )
+                    continue
+                }
+
                 // Convert to AWS tool result format
                 let toolResultBlock = AWSBedrockRuntime.BedrockRuntimeClientTypes.ToolResultBlock(
-                    content: [.text(toolResultContent.result)],
+                    content: [.text(trimmedResult)],
                     status: toolResultContent.status == "success" ? .success : .error,
-                    toolUseId: toolResultContent.toolUseId
+                    toolUseId: trimmedToolUseId
                 )
 
                 contentBlocks.append(.toolresult(toolResultBlock))
+                debugInfo.append("toolresult[\(index)]:\(trimmedToolUseId)")
 
             case .tooluse(let toolUseContent):
-                // Convert to AWS tool use format
+                // CRITICAL FIX: Enhanced tool use validation
+                let trimmedName = toolUseContent.name.trimmingCharacters(
+                    in: .whitespacesAndNewlines)
+                let trimmedToolUseId = toolUseContent.toolUseId.trimmingCharacters(
+                    in: .whitespacesAndNewlines)
+
+                guard !trimmedName.isEmpty && !trimmedToolUseId.isEmpty else {
+                    logger.error(
+                        "🚨 Invalid tool use at index \(index): empty name or toolUseId, skipping")
+                    continue
+                }
+
+                // Convert to AWS tool use format with enhanced error handling
                 do {
-                    // Convert JSONValue input to Smithy Document
-                    let swiftInputObject = toolUseContent.input.asAny
-                    let inputDocument = try Smithy.Document.make(from: swiftInputObject)
+                    // CRITICAL FIX: More robust JSONValue to Document conversion
+                    let inputDocument: Smithy.Document
+
+                    switch toolUseContent.input {
+                    case .null:
+                        inputDocument = try Smithy.Document.make(from: [String: Any]())
+                    case .object(let obj):
+                        // Ensure we have a valid object
+                        if obj.isEmpty {
+                            inputDocument = try Smithy.Document.make(from: [String: Any]())
+                        } else {
+                            let swiftObject = toolUseContent.input.asAny
+                            inputDocument = try Smithy.Document.make(from: swiftObject)
+                        }
+                    default:
+                        let swiftObject = toolUseContent.input.asAny
+                        inputDocument = try Smithy.Document.make(from: swiftObject)
+                    }
 
                     let toolUseBlock = AWSBedrockRuntime.BedrockRuntimeClientTypes.ToolUseBlock(
                         input: inputDocument,
-                        name: toolUseContent.name,
-                        toolUseId: toolUseContent.toolUseId
+                        name: trimmedName,
+                        toolUseId: trimmedToolUseId
                     )
 
                     contentBlocks.append(.tooluse(toolUseBlock))
+                    debugInfo.append("tooluse[\(index)]:\(trimmedToolUseId)")
                     logger.debug(
-                        "Successfully converted toolUse block for '\(toolUseContent.name)' with input: \(inputDocument)"
-                    )
+                        "✅ Successfully converted toolUse '\(trimmedName)' ID:\(trimmedToolUseId)")
 
                 } catch {
                     logger.error(
-                        "Failed to convert tool use input (\(toolUseContent.input)) to Smithy Document: \(error). Skipping this toolUse block in the request."
+                        "🚨 Failed to convert tool use at index \(index) - Name: '\(trimmedName)', ID: '\(trimmedToolUseId)', Input: \(toolUseContent.input), Error: \(error)"
+                    )
+                    // CRITICAL: Don't skip tool_use as it would create orphaned tool_result
+                    throw ToolUseError(
+                        message:
+                            "Tool use conversion failed for '\(trimmedName)': \(error.localizedDescription)"
                     )
                 }
             }
         }
 
-        // IMPORTANT: Do NOT reorder content blocks!
-        // The order must be preserved to maintain proper tool_use/tool_result pairing
-        // Removing all the previous reordering logic that was causing ValidationException
+        // CRITICAL FIX: Ensure message has content
+        if contentBlocks.isEmpty {
+            logger.error("🚨 CRITICAL: Message would have no content blocks after processing")
+            // Add a minimal text block to prevent ValidationException
+            contentBlocks.append(.text("Empty message"))
+            debugInfo.append("fallback_text")
+        }
+
+        logger.debug("🔍 Final message structure: \(debugInfo.joined(separator: ", "))")
 
         return AWSBedrockRuntime.BedrockRuntimeClientTypes.Message(
             content: contentBlocks,
@@ -2141,6 +3628,20 @@ class ChatViewModel: ObservableObject {
     // MARK: - Basic Message Operations
 
     func addMessage(_ message: MessageData) {
+        // NEW: Check for duplicate messages (same text from same user within 2 seconds)
+        let isDuplicate = messages.contains { existing in
+            existing.user == message.user && existing.text == message.text
+                && abs(existing.sentTime.timeIntervalSince(message.sentTime)) < 2.0
+                && existing.id != message.id
+        }
+
+        if isDuplicate {
+            logger.warning(
+                "🚫 Duplicate message blocked: Same text '\(message.text.prefix(50))...' from \(message.user)"
+            )
+            return
+        }
+
         // Check if we're updating an existing message (for streaming)
         if let id = currentStreamingMessageId,
             message.id == id,
@@ -2178,6 +3679,36 @@ class ChatViewModel: ObservableObject {
 
         // Add to chat manager
         chatManager.addMessage(convertedMessage, to: chatId)
+    }
+
+    // UIのみ追加（ストレージへは保存しない）ためのヘルパー
+    private func addUIOnlyMessage(_ message: MessageData) {
+        // NEW: 重複（同一ユーザー・同一テキスト・2秒以内）をブロック
+        let isDuplicate = messages.contains { existing in
+            existing.user == message.user && existing.text == message.text
+                && abs(existing.sentTime.timeIntervalSince(message.sentTime)) < 2.0
+                && existing.id != message.id
+        }
+
+        if isDuplicate {
+            logger.warning(
+                "🚫 Duplicate UI-only message blocked: '\(message.text.prefix(50))...' from \(message.user)"
+            )
+            return
+        }
+
+        // ストリーミング中メッセージの更新に対応
+        if let id = currentStreamingMessageId,
+            message.id == id,
+            let index = messages.firstIndex(where: { $0.id == id })
+        {
+            messages[index] = message
+        } else {
+            messages.append(message)
+        }
+
+        // ストレージへは保存しない（ChatManager.addMessageは呼ばない）
+        self.objectWillChange.send()
     }
 
     private func handleModelError(_ error: Error) async {
@@ -2299,12 +3830,12 @@ class ChatViewModel: ObservableObject {
             content: [.text(summaryPrompt)]
         )
 
-        // Use Claude-3 Haiku for title generation
-        let haikuModelId = "us.amazon.nova-pro-v1:0"
+        // Determine the best model for title generation
+        let titleGenerationModelId = selectTitleGenerationModel()
 
         do {
             // Convert to AWS SDK format
-            let awsMessage = try convertToBedrockMessage(userMsg)
+            let awsMessage = try convertToBedrockMessage(userMsg, modelId: titleGenerationModelId)
 
             // Use converseStream API to get the title
             var title = ""
@@ -2312,13 +3843,13 @@ class ChatViewModel: ObservableObject {
             let systemContentBlocks: [BedrockRuntimeClientTypes.SystemContentBlock]? = nil
 
             for try await chunk in try await backendModel.backend.converseStream(
-                withId: haikuModelId,
+                withId: titleGenerationModelId,
                 messages: [awsMessage],
                 systemContent: systemContentBlocks,
                 inferenceConfig: nil,
-                usageHandler: { usage in
+                usageHandler: { [weak self] usage in
                     // Title generation usage info
-                    print(
+                    self?.logger.debug(
                         "Title generation usage - Input: \(usage.inputTokens ?? 0), Output: \(usage.outputTokens ?? 0)"
                     )
                 }
@@ -2337,6 +3868,76 @@ class ChatViewModel: ObservableObject {
             }
         } catch {
             logger.error("Error updating chat title: \(error)")
+            // If title generation fails, create a simple fallback title
+            createFallbackTitle(from: input)
+        }
+    }
+
+    /// Selects the best available model for title generation
+    private func selectTitleGenerationModel() -> String {
+        // First, try to use the current model if it's a text generation model
+        if isTextGenerationModel(chatModel.id) {
+            logger.debug("Using current model for title generation: \(chatModel.id)")
+            return chatModel.id
+        }
+
+        // Priority list of preferred models for title generation (lightweight and efficient)
+        let preferredModels = [
+            // Amazon Nova models (lightweight)
+            "amazon.nova-lite-v1:0",
+            "us.amazon.nova-lite-v1:0",
+            "amazon.nova-micro-v1:0",
+            "us.amazon.nova-micro-v1:0",
+
+            // Claude models (Haiku is lightweight)
+            "anthropic.claude-3-haiku-20240307-v1:0",
+            "anthropic.claude-3-5-haiku-20241022-v1:0",
+
+            // Meta Llama models (smaller variants)
+            "meta.llama3-8b-instruct-v1:0",
+            "meta.llama3-1-8b-instruct-v1:0",
+
+            // Mistral models (lightweight)
+            "mistral.mistral-7b-instruct-v0:2",
+
+            // Fallback to any available Nova Pro
+            "amazon.nova-pro-v1:0",
+            "us.amazon.nova-pro-v1:0",
+
+            // Fallback to Claude Sonnet
+            "anthropic.claude-3-5-sonnet-20241022-v2:0",
+            "anthropic.claude-3-5-sonnet-20240620-v1:0",
+
+            // Additional fallbacks
+            "meta.llama3-1-70b-instruct-v1:0",
+            "anthropic.claude-3-opus-20240229-v1:0",
+        ]
+
+        // Try to find a preferred model that's available by checking each one
+        for preferredModel in preferredModels {
+            // For now, we'll try to use the preferred models directly
+            // since checking availability requires async calls
+            logger.info("Attempting to use preferred model for title generation: \(preferredModel)")
+            return preferredModel
+        }
+
+        // Final fallback - use the current model even if it's not ideal
+        logger.warning(
+            "No suitable model found for title generation, using current model: \(chatModel.id)")
+        return chatModel.id
+    }
+
+    /// Creates a simple fallback title when automatic generation fails
+    private func createFallbackTitle(from input: String) {
+        let words = input.split(separator: " ").prefix(5)
+        let fallbackTitle = words.joined(separator: " ")
+
+        if !fallbackTitle.isEmpty {
+            chatManager.updateChatTitle(
+                for: chatModel.chatId,
+                title: String(fallbackTitle)
+            )
+            logger.info("Created fallback title: \(fallbackTitle)")
         }
     }
 
@@ -3569,9 +5170,34 @@ class ChatViewModel: ObservableObject {
             }
         }
 
-        // Get conversation history
-        var conversationHistory = await getConversationHistory()
-        await saveConversationHistory(conversationHistory)
+        // Get conversation history (完全な履歴)
+        var fullConversationHistory = await getConversationHistory()
+
+        // Add user message to full history（直前が同一ユーザー同一テキストならスキップ）
+        let userBedrockMessage = BedrockMessage(role: .user, content: messageContents)
+        let newUserText = extractTextFromContents(userBedrockMessage.content)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        var shouldAppendUser = true
+        if let last = fullConversationHistory.last {
+            let lastText = extractTextFromContents(last.content)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if last.role == .user && !newUserText.isEmpty && lastText == newUserText {
+                shouldAppendUser = false
+                logger.warning(
+                    "🔧 Blocked duplicate user message append to history: '\(newUserText.prefix(50))...'"
+                )
+            }
+        }
+        if shouldAppendUser {
+            fullConversationHistory.append(userBedrockMessage)
+        }
+
+        // 完全な履歴を保存
+        await saveConversationHistory(fullConversationHistory)
+
+        // Bedrock送信用に最適化
+        let optimizedHistory = await manageConversationByCharacterCount(fullConversationHistory)
 
         // Get system prompt
         let systemPrompt = settingManager.systemPrompt.trimmingCharacters(
@@ -3580,8 +5206,8 @@ class ChatViewModel: ObservableObject {
         // Get tool configurations if MCP is enabled (but disable for non-streaming for now)
         let toolConfig: AWSBedrockRuntime.BedrockRuntimeClientTypes.ToolConfiguration? = nil
 
-        // Get Bedrock messages in AWS SDK format
-        let bedrockMessages = try conversationHistory.map {
+        // Get Bedrock messages in AWS SDK format (最適化された履歴を使用)
+        let bedrockMessages = try optimizedHistory.map {
             try convertToBedrockMessage($0, modelId: chatModel.id)
         }
 
@@ -3660,8 +5286,8 @@ class ChatViewModel: ObservableObject {
                 ] : [.text(responseText)]
         )
 
-        // Add to history and save
-        conversationHistory.append(assistantMsg)
-        await saveConversationHistory(conversationHistory)
+        // Add to full history and save (完全な履歴を保存)
+        fullConversationHistory.append(assistantMsg)
+        await saveConversationHistory(fullConversationHistory)
     }
 }

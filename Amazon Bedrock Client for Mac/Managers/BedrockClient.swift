@@ -119,8 +119,7 @@ class BackendModel: ObservableObject {
             .combineLatest(endpointPublisher)
             .combineLatest(runtimeEndpointPublisher)
             .debounce(for: .seconds(0.5), scheduler: DispatchQueue.main)
-            .sink { [weak self] combined in
-                let (((region, profile), endpoint), runtimeEndpoint) = combined
+            .sink { [weak self] _ in
                 self?.refreshBackend()
             }
             .store(in: &cancellables)
@@ -192,57 +191,38 @@ class Backend: Equatable {
         self.runtimeEndpoint = runtimeEndpoint
 
         // Try to initialize credentials in order of preference
-        do {
-            // First try: Use the specified profile from SettingManager
-            if let selectedProfile = SettingManager.shared.profiles.first(where: {
-                $0.name == profile
-            }) {
-                switch selectedProfile.type {
-                case .sso:
-                    self.awsCredentialIdentityResolver = try SSOAWSCredentialIdentityResolver(
-                        profileName: profile)
-                    logger.info("Using SSO credentials for profile: \(profile)")
-                case .credentialProcess:
-                    // For credential_process profiles, we use ProfileAWSCredentialIdentityResolver
-                    // which automatically handles credential_process directives
-                    self.awsCredentialIdentityResolver = try ProfileAWSCredentialIdentityResolver(
-                        profileName: profile)
-                    logger.info("Using credential_process for profile: \(profile)")
-                case .credentials:
-                    self.awsCredentialIdentityResolver = try ProfileAWSCredentialIdentityResolver(
-                        profileName: profile)
-                    logger.info("Using standard credentials for profile: \(profile)")
-                }
+        // First try: Use the specified profile from SettingManager
+        if let selectedProfile = SettingManager.shared.profiles.first(where: {
+            $0.name == profile
+        }) {
+            switch selectedProfile.type {
+            case .sso:
+                self.awsCredentialIdentityResolver = try SSOAWSCredentialIdentityResolver(
+                    profileName: profile)
+                logger.info("Using SSO credentials for profile: \(profile)")
+            case .credentialProcess:
+                // For credential_process profiles, we use ProfileAWSCredentialIdentityResolver
+                // which automatically handles credential_process directives
+                self.awsCredentialIdentityResolver = ProfileAWSCredentialIdentityResolver(
+                    profileName: profile)
+                logger.info("Using credential_process for profile: \(profile)")
+            case .credentials:
+                self.awsCredentialIdentityResolver = ProfileAWSCredentialIdentityResolver(
+                    profileName: profile)
+                logger.info("Using standard credentials for profile: \(profile)")
             }
-            // Second try: Use default profile if specified profile not found
-            else if profile != "default" {
-                logger.warning("Profile '\(profile)' not found, falling back to 'default' profile")
-                self.awsCredentialIdentityResolver = try ProfileAWSCredentialIdentityResolver(
-                    profileName: "default")
-            }
-            // Third try: Use default profile directly
-            else {
-                logger.info("Using default profile")
-                self.awsCredentialIdentityResolver = try ProfileAWSCredentialIdentityResolver(
-                    profileName: "default")
-            }
-        } catch {
-            // Final try: Use DefaultAWSCredentialIdentityResolverChain as last resort
-            logger.warning(
-                "Failed to initialize with profile '\(profile)': \(error.localizedDescription)")
-            logger.info("Attempting to use DefaultAWSCredentialIdentityResolverChain")
-
-            do {
-                self.awsCredentialIdentityResolver = try DefaultAWSCredentialIdentityResolverChain()
-                logger.info(
-                    "Successfully initialized with DefaultAWSCredentialIdentityResolverChain")
-            } catch {
-                // If even the default chain fails, we have no choice but to throw
-                logger.error(
-                    "Failed to initialize with DefaultAWSCredentialIdentityResolverChain: \(error.localizedDescription)"
-                )
-                throw error
-            }
+        }
+        // Second try: Use default profile if specified profile not found
+        else if profile != "default" {
+            logger.warning("Profile '\(profile)' not found, falling back to 'default' profile")
+            self.awsCredentialIdentityResolver = ProfileAWSCredentialIdentityResolver(
+                profileName: "default")
+        }
+        // Third try: Use default profile directly
+        else {
+            logger.info("Using default profile")
+            self.awsCredentialIdentityResolver = ProfileAWSCredentialIdentityResolver(
+                profileName: "default")
         }
 
         logger.info(
@@ -286,12 +266,16 @@ class Backend: Equatable {
             endpoint: self.runtimeEndpoint.isEmpty ? nil : self.runtimeEndpoint
         )
 
-        // より積極的なHTTPタイムアウト設定
-        config.httpClientConfiguration.connectTimeout = 60.0  // 接続タイムアウト: 60秒
-        config.httpClientConfiguration.socketTimeout = 600.0  // ソケットタイムアウト: 600秒（10分）
+        // AWS推奨: Claude 3.7などの長時間応答モデルには3600秒以上のタイムアウトを設定
+        // Python boto3のread_timeoutに相当する設定として、socketTimeoutを大幅に延長
+        config.httpClientConfiguration.connectTimeout = 3600.0  // 接続タイムアウト: 3600秒（60分）
+        config.httpClientConfiguration.socketTimeout = 28800.0  // ソケットタイムアウト: 28800秒（8時間）
+
+        // Note: AWS SDK for SwiftのHTTPクライアント設定では、socketTimeoutがPython boto3の
+        // read_timeoutに最も近い動作をします。この値は応答全体の読み取りに適用されます。
 
         logger.info(
-            "Bedrock Runtime client created with region: \(self.region), runtimeEndpoint: \(self.runtimeEndpoint), connectTimeout: 60s, socketTimeout: 600s"
+            "Bedrock Runtime client created with region: \(self.region), runtimeEndpoint: \(self.runtimeEndpoint), connectTimeout: 3600s, socketTimeout: 28800s"
         )
         return BedrockRuntimeClient(config: config)
     }
@@ -713,12 +697,12 @@ class Backend: Equatable {
 
             if isThinkingEnabled {
                 return BedrockRuntimeClientTypes.InferenceConfiguration(
-                    maxTokens: 8192,
+                    maxTokens: 64000,  // 1Mコンテキストをフル活用するため20万に増加
                     temperature: 1.0
                 )
             } else {
                 return BedrockRuntimeClientTypes.InferenceConfiguration(
-                    maxTokens: 8192,
+                    maxTokens: 64000,  // 1Mコンテキストをフル活用するため20万に増加
                     temperature: 0.9,
                     topp: 0.7
                 )
@@ -728,12 +712,12 @@ class Backend: Equatable {
 
             if isThinkingEnabled {
                 return BedrockRuntimeClientTypes.InferenceConfiguration(
-                    maxTokens: 8192,
+                    maxTokens: 64000,  // 1Mコンテキストをフル活用するため20万に増加
                     temperature: 1.0
                 )
             } else {
                 return BedrockRuntimeClientTypes.InferenceConfiguration(
-                    maxTokens: 8192,
+                    maxTokens: 64000,  // 1Mコンテキストをフル活用するため20万に増加
                     temperature: 0.9,
                     topp: 0.7
                 )
@@ -743,12 +727,12 @@ class Backend: Equatable {
 
             if isThinkingEnabled {
                 return BedrockRuntimeClientTypes.InferenceConfiguration(
-                    maxTokens: 64000,
+                    maxTokens: 64000,  // 1Mコンテキストをフル活用するため20万に増加
                     temperature: 1.0
                 )
             } else {
                 return BedrockRuntimeClientTypes.InferenceConfiguration(
-                    maxTokens: 8192,
+                    maxTokens: 64000,  // 1Mコンテキストをフル活用するため20万に増加
                     temperature: 0.9,
                     topp: 0.7
                 )
@@ -835,7 +819,7 @@ class Backend: Equatable {
             toolConfig: toolConfig,
             usageHandler: usageHandler,
             retryCount: 0,
-            maxRetries: 3
+            maxRetries: 10
         )
     }
 
@@ -1013,11 +997,19 @@ class Backend: Equatable {
                 )
             }
 
+            // Check if this is a context length exceeded error
+            if isContextLengthExceededError(error) {
+                logger.error("Context length exceeded error detected")
+                throw createContextLengthExceededError(originalError: error)
+            }
+
             // Check if this is a ThrottlingException or timeout error
             if (isThrottlingException(error) || isTimeoutError(error)) && retryCount < maxRetries {
                 let errorType = isThrottlingException(error) ? "ThrottlingException" : "Timeout"
-                // より長い待機時間を設定（特にタイムアウトエラーの場合）
-                let waitTime = isThrottlingException(error) ? 60 : 45  // 60秒 for throttling, 45秒 for timeout
+                // AWS推奨: ThrottlingExceptionの場合は指数バックオフを使用
+                // Timeoutの場合も同様に長めの待機時間を設定
+                let baseWaitTime = isThrottlingException(error) ? 120 : 180
+                let waitTime = baseWaitTime * (retryCount + 1)  // 指数バックオフ的に待機時間を増やす
 
                 logger.warning(
                     "\(errorType) detected (attempt \(retryCount + 1)/\(maxRetries + 1)). Error details: \(error.localizedDescription). Waiting \(waitTime) seconds before retry..."
@@ -1116,9 +1108,63 @@ class Backend: Equatable {
         return false
     }
 
+    /// Check if the error is an input context length exceeded error
+    private func isContextLengthExceededError(_ error: Error) -> Bool {
+        let errorDescription = error.localizedDescription.lowercased()
+
+        // Check for context length related error messages
+        if errorDescription.contains("input is too long")
+            || errorDescription.contains("context length")
+            || errorDescription.contains("maximum context")
+            || errorDescription.contains("exceeds maximum")
+            || errorDescription.contains("token limit")
+            || errorDescription.contains("input length")
+        {
+            return true
+        }
+
+        // Check for ValidationException specifically
+        if let awsError = error as? AWSClientRuntime.AWSServiceError {
+            if let typeName = awsError.typeName?.lowercased() {
+                if typeName.contains("validationexception") {
+                    // Check the message content
+                    if let message = awsError.message?.lowercased() {
+                        return message.contains("input is too long")
+                            || message.contains("context length")
+                            || message.contains("maximum context")
+                            || message.contains("token limit")
+                    }
+                }
+            }
+        }
+
+        return false
+    }
+
+    /// Create a user-friendly error for context length exceeded
+    private func createContextLengthExceededError(originalError: Error) -> NSError {
+        return NSError(
+            domain: "BedrockClient",
+            code: 400,
+            userInfo: [
+                NSLocalizedDescriptionKey: "入力コンテキスト長の上限を超えました",
+                NSLocalizedFailureReasonErrorKey: "会話履歴またはメッセージが長すぎるため、選択したモデルの最大トークン数を超えています。",
+                NSLocalizedRecoverySuggestionErrorKey: """
+                以下の対処方法をお試しください:
+                • 新しいチャットを開始する
+                • 会話履歴の一部を削除する
+                • より大きなコンテキストウィンドウを持つモデルを選択する
+                • メッセージの内容を短くする
+
+                元のエラー: \(originalError.localizedDescription)
+                """,
+            ]
+        )
+    }
+
     /// Non-streaming converse method with retry logic for ThrottlingException
     func converse(input: ConverseInput) async throws -> ConverseOutput {
-        return try await converseWithRetry(input: input, retryCount: 0, maxRetries: 3)
+        return try await converseWithRetry(input: input, retryCount: 0, maxRetries: 10)
     }
 
     /// Internal method with retry logic for non-streaming converse
@@ -1133,7 +1179,9 @@ class Backend: Equatable {
             // Check if this is a ThrottlingException or timeout error
             if (isThrottlingException(error) || isTimeoutError(error)) && retryCount < maxRetries {
                 let errorType = isThrottlingException(error) ? "ThrottlingException" : "Timeout"
-                let waitTime = isThrottlingException(error) ? 60 : 30  // 60秒 for throttling, 30秒 for timeout
+                // AWS推奨: 指数バックオフを使用して待機時間を増やす
+                let baseWaitTime = isThrottlingException(error) ? 120 : 180
+                let waitTime = baseWaitTime * (retryCount + 1)
 
                 logger.warning(
                     "\(errorType) detected in converse (attempt \(retryCount + 1)/\(maxRetries + 1)). Waiting \(waitTime) seconds before retry..."

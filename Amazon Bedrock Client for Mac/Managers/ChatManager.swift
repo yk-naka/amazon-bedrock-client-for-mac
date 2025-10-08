@@ -130,6 +130,9 @@ class ChatManager: ObservableObject {
 
     private var logger = Logger(label: "ChatManager")
 
+    // Semantic cache integration
+    private var enableSemanticCache: Bool = true  // デフォルトで有効
+
     private init() {
         self.coreDataStack = CoreDataStack(modelName: "ChatModel")
         self.loadChats()
@@ -454,6 +457,13 @@ class ChatManager: ObservableObject {
 
         history.addMessage(message)
         saveConversationHistory(history, for: chatId)
+
+        // Semantic cacheへの自動保存
+        if enableSemanticCache {
+            Task {
+                await saveMessageToSemanticCache(message, chatId: chatId)
+            }
+        }
 
         // Update UI state
         DispatchQueue.main.async {
@@ -1091,5 +1101,119 @@ class ChatManager: ObservableObject {
         } catch {
             logger.info("Failed to clear files: \(error)")
         }
+    }
+
+    // MARK: - Semantic Cache Integration
+
+    /// メッセージをsemantic cacheに自動保存
+    /// 各チャットは独立したconversation_idを持ち、会話が混ざらないようになっています
+    private func saveMessageToSemanticCache(_ message: Message, chatId: String) async {
+        guard ContextManager.shared.currentProjectId != nil else {
+            logger.debug("ContextManager not initialized, skipping semantic cache save")
+            return
+        }
+
+        do {
+            // 各チャット専用のconversation_idを使用（会話の分離）
+            let chatConversationId = "chat_\(chatId)"
+
+            let messageText = """
+                [チャット: \(chatId)]
+                [ロール: \(message.role.rawValue)]
+                [タイムスタンプ: \(ISO8601DateFormatter().string(from: message.timestamp))]
+
+                \(message.text)
+                """
+
+            // semantic cacheに保存（チャット専用のconversation_id）
+            let searchResults = try await ContextManager.shared.search(
+                query: messageText,
+                projectId: chatConversationId,
+                maxResults: 1
+            )
+
+            // 重複チェック（類似度が非常に高い場合はスキップ）
+            if let first = searchResults.first, first.similarity > 0.95 {
+                logger.debug("Similar message already in cache, skipping")
+                return
+            }
+
+            // 新しいメッセージとして保存（チャット専用のconversation_id）
+            _ = try await ContextManager.shared.executeMCPTool(
+                serverName: "semantic-cache",
+                toolName: "add_text_data",
+                arguments: [
+                    "text": messageText,
+                    "conversation_id": chatConversationId,  // ← チャット専用ID
+                    "enable_chunking": false,
+                    "metadata": [
+                        "type": "chat_message",
+                        "chat_id": chatId,
+                        "role": message.role.rawValue,
+                        "timestamp": ISO8601DateFormatter().string(from: message.timestamp),
+                    ],
+                ]
+            )
+
+            logger.debug(
+                "Saved message to semantic cache with conversation_id: \(chatConversationId)")
+        } catch {
+            logger.warning("Failed to save to semantic cache: \(error.localizedDescription)")
+        }
+    }
+
+    /// semantic cacheから関連する会話を取得（特定チャットのみ）
+    func getRelevantContextFromCache(query: String, chatId: String, limit: Int = 5) async
+        -> [ContextItem]
+    {
+        guard ContextManager.shared.currentProjectId != nil else {
+            logger.debug("ContextManager not initialized")
+            return []
+        }
+
+        do {
+            // チャット専用のconversation_idで検索（他のチャットと混ざらない）
+            let chatConversationId = "chat_\(chatId)"
+            return try await ContextManager.shared.search(
+                query: query,
+                projectId: chatConversationId,
+                maxResults: limit
+            )
+        } catch {
+            logger.error("Failed to get context from cache: \(error.localizedDescription)")
+            return []
+        }
+    }
+
+    /// チャット開始時に関連コンテキストを取得（このチャット内のみ）
+    func getContextSummaryForNewChat(chatId: String) async -> String? {
+        guard let chat = getChatModel(for: chatId) else {
+            return nil
+        }
+
+        // 最近のメッセージから検索クエリを作成
+        let messages = getMessages(for: chatId)
+        guard !messages.isEmpty else {
+            return nil
+        }
+
+        let recentMessages = messages.suffix(3)
+        let query = recentMessages.map { $0.text }.joined(separator: " ")
+
+        // このチャット専用のconversation_idで検索
+        let contextItems = await getRelevantContextFromCache(query: query, chatId: chatId, limit: 3)
+
+        if contextItems.isEmpty {
+            return nil
+        }
+
+        var summary = "## このチャットの関連する過去の会話\n\n"
+        for (index, item) in contextItems.enumerated() {
+            summary += "### \(index + 1). \(item.title)\n"
+            summary += "類似度: \(String(format: "%.2f", item.similarity))\n"
+            summary += "\(item.content.prefix(200))...\n\n"
+        }
+
+        return summary
     }
 }

@@ -216,13 +216,29 @@ echo ""
 # Step 4: ビルドされたアプリケーションを Applications フォルダにコピー
 echo -e "${YELLOW}Step 4: アプリケーションを Applications フォルダにコピー中...${NC}"
 
-# ビルドされたアプリのパスを探す（DerivedDataディレクトリから探す）
-# より柔軟なパターンで検索（Amazon Bedrock Debug.app などの名前も対応）
-BUILT_APP_PATH=$(find "$DERIVED_DATA_PATH" -name "*Amazon*Bedrock*.app" -type d 2>/dev/null | grep -E "(Debug|Release)" | head -1)
+# ビルドされたアプリのパスを探す（正しいBuild/Productsパスから）
+# Index.noindexは除外する
+BUILT_APP_PATH=$(find "$DERIVED_DATA_PATH" -path "*/Build/Products/$CONFIGURATION/*Amazon*Bedrock*.app" -type d 2>/dev/null | grep -v "Index.noindex" | head -1)
 
 # もしDerivedDataで見つからない場合は、buildディレクトリからも探す
 if [ -z "$BUILT_APP_PATH" ] && [ -d "$BUILD_DIR" ]; then
     BUILT_APP_PATH=$(find "$BUILD_DIR" -name "$APP_NAME.app" -type d | head -1)
+fi
+
+# デバッグ: 見つかったパスを表示
+if [ -n "$BUILT_APP_PATH" ]; then
+    echo -e "${BLUE}発見されたアプリ: $BUILT_APP_PATH${NC}"
+    
+    # 実行ファイルの存在確認
+    EXECUTABLE_NAME=$(defaults read "$BUILT_APP_PATH/Contents/Info.plist" CFBundleExecutable 2>/dev/null || echo "Amazon Bedrock Debug")
+    EXECUTABLE_PATH="$BUILT_APP_PATH/Contents/MacOS/$EXECUTABLE_NAME"
+    
+    if [ -f "$EXECUTABLE_PATH" ]; then
+        EXEC_SIZE=$(ls -lh "$EXECUTABLE_PATH" | awk '{print $5}')
+        echo -e "${GREEN}✓ 実行ファイル確認: $EXECUTABLE_NAME ($EXEC_SIZE)${NC}"
+    else
+        echo -e "${RED}⚠️  実行ファイルが見つかりません: $EXECUTABLE_PATH${NC}"
+    fi
 fi
 
 if [ -n "$BUILT_APP_PATH" ] && [ -d "$BUILT_APP_PATH" ]; then

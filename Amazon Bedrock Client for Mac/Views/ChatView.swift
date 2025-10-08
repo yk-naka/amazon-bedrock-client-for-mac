@@ -8,6 +8,29 @@
 import Combine
 import SwiftUI
 
+/// Global singleton to prevent duplicate message sends across all views
+final class MessageSendLock {
+    static let shared = MessageSendLock()
+    private var isLocked = false
+    private let queue = DispatchQueue(label: "com.bedrock.messageSendLock")
+
+    private init() {}
+
+    func tryLock() -> Bool {
+        return queue.sync {
+            guard !isLocked else { return false }
+            isLocked = true
+            return true
+        }
+    }
+
+    func unlock() {
+        queue.sync {
+            isLocked = false
+        }
+    }
+}
+
 struct BottomAnchorPreferenceKey: PreferenceKey {
     typealias Value = CGFloat
     static var defaultValue: CGFloat = 0
@@ -44,6 +67,9 @@ struct ChatView: View {
     @State private var showUsageToast: Bool = false
     @State private var currentUsage: String = ""
     @State private var usageToastTimer: Timer?
+
+    // NEW: Exclusive send lock at ChatView level (the most reliable place)
+    @State private var isSendingMessage = false
 
     init(chatId: String, backendModel: BackendModel) {
         let sharedMediaDataSource = SharedMediaDataSource()
@@ -331,10 +357,51 @@ struct ChatView: View {
             userInput: $viewModel.userInput,
             sharedMediaDataSource: sharedMediaDataSource,
             transcribeManager: transcribeManager,
-            sendMessage: viewModel.sendMessage,
+            sendMessage: sendMessageWrapper,
             cancelSending: viewModel.cancelSending,
             modelId: viewModel.chatModel.id
         )
+    }
+
+    // NEW: Wrapper function with GLOBAL exclusive lock - hold lock UNTIL VM send completes
+    private func sendMessageWrapper() async {
+        // Use global singleton for GUARANTEED exclusion
+        guard MessageSendLock.shared.tryLock() else {
+            print("🚫 ULTIMATE FIX: MessageSendLock blocked duplicate (global singleton)")
+            return
+        }
+
+        // Also set local flag for safety
+        isSendingMessage = true
+        defer {
+            isSendingMessage = false
+            MessageSendLock.shared.unlock()
+        }
+
+        // If VM is already sending, bail early (prevents double trigger from UI)
+        let alreadySending = await MainActor.run { viewModel.isSending }
+        if alreadySending {
+            return
+        }
+
+        // Trigger actual send on MainActor
+        await MainActor.run {
+            viewModel.sendMessage()
+        }
+
+        // Wait until VM sends actually starts (isSending flips to true), up to ~3s
+        for _ in 0..<60 {
+            let started = await MainActor.run { viewModel.isSending }
+            if started { break }
+            try? await Task.sleep(nanoseconds: 50_000_000)  // 50ms
+        }
+
+        // Hold the lock until VM finishes sending (isSending becomes false)
+        while true {
+            let sending = await MainActor.run { viewModel.isSending }
+            if !sending { break }
+            try? await Task.sleep(nanoseconds: 50_000_000)  // 50ms
+        }
     }
 
     // MARK: - Find Bar Components
