@@ -3110,7 +3110,7 @@ class ChatViewModel: ObservableObject {
     }
 
     /// Creates minimal tool use message content in AWS Bedrock API compliant format
-    /// STRICT: Assistant message must contain ONLY tool_use block to ensure the next message is user(tool_result)
+    /// AWS Bedrock requires assistant messages with tool_use to also have text content
     private func createMinimalToolUseMessage(
         text: String,
         thinking: String?,
@@ -3118,8 +3118,27 @@ class ChatViewModel: ObservableObject {
         toolUse: MessageContent.ToolUseContent,
         modelId: String
     ) -> [MessageContent] {
-        // Return tool_use ONLY to satisfy "immediately after" constraint strictly
-        return [.tooluse(toolUse)]
+        var contents: [MessageContent] = []
+
+        // Add thinking if present (for reasoning-capable models)
+        if let thinking = thinking, let signature = thinkingSignature,
+            !isDeepSeekModel(modelId) && !isOpenAIModel(modelId)
+        {
+            contents.append(
+                .thinking(MessageContent.ThinkingContent(text: thinking, signature: signature)))
+        }
+
+        // CRITICAL: Always add text content before tool_use
+        // AWS Bedrock requires text content in assistant messages with tool_use
+        let textToUse =
+            text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? "I'll help you with that." : text
+        contents.append(.text(textToUse))
+
+        // Add tool use
+        contents.append(.tooluse(toolUse))
+
+        return contents
     }
 
     /// Emergency tool cleanup that removes ALL tool-related content from conversation history

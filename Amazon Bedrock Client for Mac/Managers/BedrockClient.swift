@@ -1006,10 +1006,8 @@ class Backend: Equatable {
             // Check if this is a ThrottlingException or timeout error
             if (isThrottlingException(error) || isTimeoutError(error)) && retryCount < maxRetries {
                 let errorType = isThrottlingException(error) ? "ThrottlingException" : "Timeout"
-                // AWS推奨: ThrottlingExceptionの場合は指数バックオフを使用
-                // Timeoutの場合も同様に長めの待機時間を設定
-                let baseWaitTime = isThrottlingException(error) ? 120 : 180
-                let waitTime = baseWaitTime * (retryCount + 1)  // 指数バックオフ的に待機時間を増やす
+                // タイムアウトやThrottlingExceptionの場合、30秒待機してからリトライ
+                let waitTime = 30
 
                 logger.warning(
                     "\(errorType) detected (attempt \(retryCount + 1)/\(maxRetries + 1)). Error details: \(error.localizedDescription). Waiting \(waitTime) seconds before retry..."
@@ -1018,7 +1016,7 @@ class Backend: Equatable {
                 // Wait before retry
                 try await Task.sleep(nanoseconds: UInt64(waitTime) * 1_000_000_000)
 
-                // Retry the request with exponential backoff
+                // Retry the request
                 return try await converseStreamWithRetry(
                     withId: modelId,
                     messages: messages,
@@ -1179,9 +1177,8 @@ class Backend: Equatable {
             // Check if this is a ThrottlingException or timeout error
             if (isThrottlingException(error) || isTimeoutError(error)) && retryCount < maxRetries {
                 let errorType = isThrottlingException(error) ? "ThrottlingException" : "Timeout"
-                // AWS推奨: 指数バックオフを使用して待機時間を増やす
-                let baseWaitTime = isThrottlingException(error) ? 120 : 180
-                let waitTime = baseWaitTime * (retryCount + 1)
+                // タイムアウトやThrottlingExceptionの場合、30秒待機してからリトライ
+                let waitTime = 30
 
                 logger.warning(
                     "\(errorType) detected in converse (attempt \(retryCount + 1)/\(maxRetries + 1)). Waiting \(waitTime) seconds before retry..."
