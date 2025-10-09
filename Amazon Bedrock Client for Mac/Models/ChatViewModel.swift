@@ -1310,239 +1310,265 @@ class ChatViewModel: ObservableObject {
         // Reset tool tracker
         await ToolUseTracker.shared.reset()
 
-        // Stream chunks from the model (use sanitized messages)
-        for try await chunk in try await backendModel.backend.converseStream(
-            withId: chatModel.id,
-            messages: sanitizedMessages,
-            systemContent: systemContentBlock,
-            inferenceConfig: nil,
-            toolConfig: toolConfig,
-            usageHandler: { [weak self] usage in
-                // Format usage information for toast display
-                let formattedUsage = self?.formatUsageString(usage) ?? ""
-                self?.usageHandler?(formattedUsage)
-            }
-        ) {
-            // Check for tool use in each chunk
-            if let toolUseInfo = await extractToolUseFromChunk(chunk) {
-                toolWasUsed = true
-                logger.info("Tool use detected in cycle \(turnCount+1): \(toolUseInfo.name)")
-
-                // Create tool info object from the extracted data
-                currentToolInfo = ToolInfo(
-                    id: toolUseInfo.toolUseId,
-                    name: toolUseInfo.name,
-                    input: JSONValue.from(toolUseInfo.input)
-                )
-
-                // If this is our first message (no content streamed yet), create a new message
-                if isFirstChunk {
-                    // If first message, create initial message but don't update text later
-                    let initialMessage = MessageData(
-                        id: messageId,
-                        text: streamedText.isEmpty ? "Analyzing your request..." : streamedText,
-                        user: chatModel.name,
-                        isError: false,
-                        sentTime: Date(),
-                        toolUse: currentToolInfo
-                    )
-                    addUIOnlyMessage(initialMessage)
-                    isFirstChunk = false
-                } else {
-                    // If message already exists, keep text as is and only update tool info
-                    if let index = self.messages.firstIndex(where: { $0.id == messageId }) {
-                        // Preserve the current displayed text
-                        let currentText = self.messages[index].text
-
-                        // Update tool info in UI only
-                        self.messages[index].toolUse = currentToolInfo
-
-                        // Update storage (without changing text)
-                        chatManager.updateMessageWithToolInfo(
-                            for: chatId,
-                            messageId: messageId,
-                            newText: currentText,  // Keep existing text
-                            toolInfo: currentToolInfo!
-                        )
-                    }
+        // Stream chunks from the model (use sanitized messages) with retry handling
+        do {
+            for try await chunk in try await backendModel.backend.converseStream(
+                withId: chatModel.id,
+                messages: sanitizedMessages,
+                systemContent: systemContentBlock,
+                inferenceConfig: nil,
+                toolConfig: toolConfig,
+                usageHandler: { [weak self] usage in
+                    // Format usage information for toast display
+                    let formattedUsage = self?.formatUsageString(usage) ?? ""
+                    self?.usageHandler?(formattedUsage)
                 }
+            ) {
+                // Check for tool use in each chunk
+                if let toolUseInfo = await extractToolUseFromChunk(chunk) {
+                    toolWasUsed = true
+                    logger.info("Tool use detected in cycle \(turnCount+1): \(toolUseInfo.name)")
 
-                // Execute the tool with fixed Sendable result handling
-                logger.info("Executing MCP tool: \(toolUseInfo.name)")
-                let toolResult = await executeSendableMCPTool(
-                    id: toolUseInfo.toolUseId,
-                    name: toolUseInfo.name,
-                    input: toolUseInfo.input
-                )
-
-                // Extract result text and status
-                let status = toolResult.status
-                let resultText = toolResult.text
-
-                logger.info("Tool execution completed with status: \(status)")
-
-                // Create tool result info for modal
-                let newToolResult = ToolResultInfo(
-                    toolUseId: toolUseInfo.toolUseId,
-                    toolName: toolUseInfo.name,
-                    input: JSONValue.from(toolUseInfo.input),
-                    result: resultText,
-                    status: status
-                )
-
-                // Add to tool results collection
-                toolResults.append(newToolResult)
-
-                // Get the existing message text to preserve in history
-                let preservedText =
-                    isFirstChunk
-                    ? streamedText
-                    : (messages.first(where: { $0.id == messageId })?.text ?? streamedText)
-
-                // Update both UI and storage consistently
-                updateMessageWithToolInfo(
-                    messageId: messageId,
-                    newText: nil,  // Pass nil to preserve existing text
-                    toolInfo: currentToolInfo,
-                    toolResult: resultText
-                )
-
-                // CRITICAL FIX: Create tool messages in AWS Bedrock API compliant format
-                // AWS Bedrock requires EXACT pairing: assistant(tool_use) -> user(tool_result)
-
-                // 1. Assistant message with ONLY tool_use (minimal text)
-                let assistantWithToolUse = BedrockMessage(
-                    role: .assistant,
-                    content: createMinimalToolUseMessage(
-                        text: preservedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                            ? "I'll help you with that." : preservedText,
-                        thinking: thinking,
-                        thinkingSignature: thinkingSignature,
-                        toolUse: MessageContent.ToolUseContent(
-                            toolUseId: toolUseInfo.toolUseId,
-                            name: toolUseInfo.name,
-                            input: currentToolInfo!.input
-                        ),
-                        modelId: chatModel.id
+                    // Create tool info object from the extracted data
+                    currentToolInfo = ToolInfo(
+                        id: toolUseInfo.toolUseId,
+                        name: toolUseInfo.name,
+                        input: JSONValue.from(toolUseInfo.input)
                     )
-                )
 
-                // 2. User message with ONLY tool_result (no other content)
-                let userWithToolResult = BedrockMessage(
-                    role: .user,
-                    content: [
-                        .toolresult(
-                            MessageContent.ToolResultContent(
-                                toolUseId: toolUseInfo.toolUseId,
-                                result: resultText,
-                                status: status
-                            ))
-                    ]
-                )
+                    // If this is our first message (no content streamed yet), create a new message
+                    if isFirstChunk {
+                        // If first message, create initial message but don't update text later
+                        let initialMessage = MessageData(
+                            id: messageId,
+                            text: streamedText.isEmpty ? "Analyzing your request..." : streamedText,
+                            user: chatModel.name,
+                            isError: false,
+                            sentTime: Date(),
+                            toolUse: currentToolInfo
+                        )
+                        addUIOnlyMessage(initialMessage)
+                        isFirstChunk = false
+                    } else {
+                        // If message already exists, keep text as is and only update tool info
+                        if let index = self.messages.firstIndex(where: { $0.id == messageId }) {
+                            // Preserve the current displayed text
+                            let currentText = self.messages[index].text
 
-                // CRITICAL: Before adding tool pair, verify no duplicate assistant messages
-                if let lastMessage = fullConversationHistory.last {
-                    if lastMessage.role == .assistant {
-                        // Check if this is a duplicate (same text content)
-                        let lastText = extractTextFromContents(lastMessage.content)
-                            .trimmingCharacters(in: .whitespacesAndNewlines)
-                        let newText = preservedText.trimmingCharacters(in: .whitespacesAndNewlines)
+                            // Update tool info in UI only
+                            self.messages[index].toolUse = currentToolInfo
 
-                        if lastText == newText && !newText.isEmpty {
-                            logger.warning(
-                                "🔧 Detected duplicate assistant message before adding tool pair, removing duplicate"
+                            // Update storage (without changing text)
+                            chatManager.updateMessageWithToolInfo(
+                                for: chatId,
+                                messageId: messageId,
+                                newText: currentText,  // Keep existing text
+                                toolInfo: currentToolInfo!
                             )
-                            fullConversationHistory.removeLast()
                         }
                     }
-                }
 
-                // Add messages in STRICT order: assistant(tool_use) first, then user(tool_result)
-                fullConversationHistory.append(assistantWithToolUse)
-                fullConversationHistory.append(userWithToolResult)
+                    // Execute the tool with fixed Sendable result handling
+                    logger.info("Executing MCP tool: \(toolUseInfo.name)")
+                    let toolResult = await executeSendableMCPTool(
+                        id: toolUseInfo.toolUseId,
+                        name: toolUseInfo.name,
+                        input: toolUseInfo.input
+                    )
 
-                logger.info(
-                    "✅ Added AWS compliant tool pair: assistant(tool_use) -> user(tool_result) for ID: \(toolUseInfo.toolUseId)"
-                )
-                logger.info(
-                    "📊 Current history state: \(fullConversationHistory.count) messages, last 3 roles: \(fullConversationHistory.suffix(3).map { $0.role.rawValue }.joined(separator: " -> "))"
-                )
+                    // Extract result text and status
+                    let status = toolResult.status
+                    let resultText = toolResult.text
 
-                // 完全な履歴を保存（要約されない）
-                await saveConversationHistory(fullConversationHistory)
+                    logger.info("Tool execution completed with status: \(status)")
 
-                // Bedrock送信用に最適化
-                let optimizedHistoryForNextCycle = await manageConversationByCharacterCount(
-                    fullConversationHistory)
+                    // Create tool result info for modal
+                    let newToolResult = ToolResultInfo(
+                        toolUseId: toolUseInfo.toolUseId,
+                        toolName: toolUseInfo.name,
+                        input: JSONValue.from(toolUseInfo.input),
+                        result: resultText,
+                        status: status
+                    )
 
-                // Pre-validate before conversion to catch issues early
-                do {
-                    let testMessages = try optimizedHistoryForNextCycle.map {
-                        try convertToBedrockMessage($0, modelId: chatModel.id)
+                    // Add to tool results collection
+                    toolResults.append(newToolResult)
+
+                    // Get the existing message text to preserve in history
+                    let preservedText =
+                        isFirstChunk
+                        ? streamedText
+                        : (messages.first(where: { $0.id == messageId })?.text ?? streamedText)
+
+                    // Update both UI and storage consistently
+                    updateMessageWithToolInfo(
+                        messageId: messageId,
+                        newText: nil,  // Pass nil to preserve existing text
+                        toolInfo: currentToolInfo,
+                        toolResult: resultText
+                    )
+
+                    // CRITICAL FIX: Create tool messages in AWS Bedrock API compliant format
+                    // AWS Bedrock requires EXACT pairing: assistant(tool_use) -> user(tool_result)
+
+                    // 1. Assistant message with ONLY tool_use (minimal text)
+                    let assistantWithToolUse = BedrockMessage(
+                        role: .assistant,
+                        content: createMinimalToolUseMessage(
+                            text: preservedText.trimmingCharacters(in: .whitespacesAndNewlines)
+                                .isEmpty
+                                ? "I'll help you with that." : preservedText,
+                            thinking: thinking,
+                            thinkingSignature: thinkingSignature,
+                            toolUse: MessageContent.ToolUseContent(
+                                toolUseId: toolUseInfo.toolUseId,
+                                name: toolUseInfo.name,
+                                input: currentToolInfo!.input
+                            ),
+                            modelId: chatModel.id
+                        )
+                    )
+
+                    // 2. User message with ONLY tool_result (no other content)
+                    let userWithToolResult = BedrockMessage(
+                        role: .user,
+                        content: [
+                            .toolresult(
+                                MessageContent.ToolResultContent(
+                                    toolUseId: toolUseInfo.toolUseId,
+                                    result: resultText,
+                                    status: status
+                                ))
+                        ]
+                    )
+
+                    // CRITICAL: Before adding tool pair, verify no duplicate assistant messages
+                    if let lastMessage = fullConversationHistory.last {
+                        if lastMessage.role == .assistant {
+                            // Check if this is a duplicate (same text content)
+                            let lastText = extractTextFromContents(lastMessage.content)
+                                .trimmingCharacters(in: .whitespacesAndNewlines)
+                            let newText = preservedText.trimmingCharacters(
+                                in: .whitespacesAndNewlines)
+
+                            if lastText == newText && !newText.isEmpty {
+                                logger.warning(
+                                    "🔧 Detected duplicate assistant message before adding tool pair, removing duplicate"
+                                )
+                                fullConversationHistory.removeLast()
+                            }
+                        }
                     }
-                    try validateMessageStructure(testMessages)
-                    logger.info("✅ Pre-validation passed for \(testMessages.count) messages")
-                } catch {
-                    logger.error("❌ Pre-validation failed: \(error)")
-                    // Use emergency cleanup
-                    logger.info("🚨 Activating emergency tool cleanup...")
-                    let cleanedHistory = await emergencyToolCleanup(optimizedHistoryForNextCycle)
-                    // emergencyToolCleanupは送信用のみに使用、保存はしない
 
-                    // 完全な履歴からツールをクリーンアップして保存
-                    let cleanedFullHistory = await emergencyToolCleanup(fullConversationHistory)
-                    await saveConversationHistory(cleanedFullHistory)
-                }
+                    // Add messages in STRICT order: assistant(tool_use) first, then user(tool_result)
+                    fullConversationHistory.append(assistantWithToolUse)
+                    fullConversationHistory.append(userWithToolResult)
 
-                // Create updated messages for next cycle (最適化された履歴を使用)
-                let updatedMessages: [AWSBedrockRuntime.BedrockRuntimeClientTypes.Message]
-                do {
-                    updatedMessages = try optimizedHistoryForNextCycle.map {
-                        try convertToBedrockMessage($0, modelId: chatModel.id)
-                    }
                     logger.info(
-                        "✅ Successfully converted \(updatedMessages.count) messages for next cycle")
-                } catch {
-                    logger.error("❌ Critical: Message conversion failed: \(error)")
-                    throw ToolUseError(
-                        message: "メッセージ変換エラー: \(error.localizedDescription). ツール使用を停止します。")
+                        "✅ Added AWS compliant tool pair: assistant(tool_use) -> user(tool_result) for ID: \(toolUseInfo.toolUseId)"
+                    )
+                    logger.info(
+                        "📊 Current history state: \(fullConversationHistory.count) messages, last 3 roles: \(fullConversationHistory.suffix(3).map { $0.role.rawValue }.joined(separator: " -> "))"
+                    )
+
+                    // 完全な履歴を保存（要約されない）
+                    await saveConversationHistory(fullConversationHistory)
+
+                    // Bedrock送信用に最適化
+                    let optimizedHistoryForNextCycle = await manageConversationByCharacterCount(
+                        fullConversationHistory)
+
+                    // Pre-validate before conversion to catch issues early
+                    do {
+                        let testMessages = try optimizedHistoryForNextCycle.map {
+                            try convertToBedrockMessage($0, modelId: chatModel.id)
+                        }
+                        try validateMessageStructure(testMessages)
+                        logger.info("✅ Pre-validation passed for \(testMessages.count) messages")
+                    } catch {
+                        logger.error("❌ Pre-validation failed: \(error)")
+                        // Use emergency cleanup
+                        logger.info("🚨 Activating emergency tool cleanup...")
+                        let cleanedHistory = await emergencyToolCleanup(
+                            optimizedHistoryForNextCycle)
+                        // emergencyToolCleanupは送信用のみに使用、保存はしない
+
+                        // 完全な履歴からツールをクリーンアップして保存
+                        let cleanedFullHistory = await emergencyToolCleanup(fullConversationHistory)
+                        await saveConversationHistory(cleanedFullHistory)
+                    }
+
+                    // Create updated messages for next cycle (最適化された履歴を使用)
+                    let updatedMessages: [AWSBedrockRuntime.BedrockRuntimeClientTypes.Message]
+                    do {
+                        updatedMessages = try optimizedHistoryForNextCycle.map {
+                            try convertToBedrockMessage($0, modelId: chatModel.id)
+                        }
+                        logger.info(
+                            "✅ Successfully converted \(updatedMessages.count) messages for next cycle"
+                        )
+                    } catch {
+                        logger.error("❌ Critical: Message conversion failed: \(error)")
+                        throw ToolUseError(
+                            message: "メッセージ変換エラー: \(error.localizedDescription). ツール使用を停止します。")
+                    }
+
+                    // Recursively continue with next turn
+                    // CRITICAL FIX: メモリ上の最新履歴を引き継ぐ
+                    try await processToolCycles(
+                        bedrockMessages: updatedMessages,
+                        systemContentBlock: systemContentBlock,
+                        toolConfig: toolConfig,
+                        turnCount: turnCount + 1,
+                        maxTurns: maxTurns,
+                        currentFullHistory: fullConversationHistory
+                    )
+
+                    // End this turn's processing
+                    return
                 }
 
-                // Recursively continue with next turn
-                // CRITICAL FIX: メモリ上の最新履歴を引き継ぐ
-                try await processToolCycles(
-                    bedrockMessages: updatedMessages,
-                    systemContentBlock: systemContentBlock,
-                    toolConfig: toolConfig,
-                    turnCount: turnCount + 1,
-                    maxTurns: maxTurns,
-                    currentFullHistory: fullConversationHistory
-                )
+                // Process regular text chunk if no tool was detected
+                if let textChunk = extractTextFromChunk(chunk) {
+                    streamedText += textChunk
+                    appendTextToMessage(
+                        textChunk, messageId: messageId, shouldCreateNewMessage: isFirstChunk)
+                    isFirstChunk = false
+                }
 
-                // End this turn's processing
-                return
-            }
+                // Process thinking chunk
+                let thinkingResult = extractThinkingFromChunk(chunk)
+                if let thinkingText = thinkingResult.text {
+                    thinking = (thinking ?? "") + thinkingText
+                    appendThinkingToMessage(
+                        thinkingText, messageId: messageId, shouldCreateNewMessage: isFirstChunk)
+                    isFirstChunk = false
+                }
 
-            // Process regular text chunk if no tool was detected
-            if let textChunk = extractTextFromChunk(chunk) {
-                streamedText += textChunk
-                appendTextToMessage(
-                    textChunk, messageId: messageId, shouldCreateNewMessage: isFirstChunk)
-                isFirstChunk = false
+                if let thinkingSignatureText = thinkingResult.signature {
+                    thinkingSignature = thinkingSignatureText
+                }
             }
+        } catch let streamingError as StreamingRetryableError {
+            // Handle streaming retry errors with 30 second wait
+            logger.warning(
+                "⚠️ StreamingRetryableError caught: \(streamingError.errorType) during streaming, waiting 30 seconds before retry..."
+            )
 
-            // Process thinking chunk
-            let thinkingResult = extractThinkingFromChunk(chunk)
-            if let thinkingText = thinkingResult.text {
-                thinking = (thinking ?? "") + thinkingText
-                appendThinkingToMessage(
-                    thinkingText, messageId: messageId, shouldCreateNewMessage: isFirstChunk)
-                isFirstChunk = false
-            }
+            // Wait 30 seconds
+            try await Task.sleep(nanoseconds: 30_000_000_000)
 
-            if let thinkingSignatureText = thinkingResult.signature {
-                thinkingSignature = thinkingSignatureText
-            }
+            // Retry the entire processToolCycles with incremented retry count
+            logger.info("♻️ Retrying processToolCycles after streaming timeout...")
+
+            return try await processToolCycles(
+                bedrockMessages: bedrockMessages,
+                systemContentBlock: systemContentBlock,
+                toolConfig: toolConfig,
+                turnCount: turnCount,
+                maxTurns: maxTurns,
+                currentFullHistory: fullConversationHistory
+            )
         }
 
         // If we get here, the model completed its response without using a tool

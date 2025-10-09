@@ -984,7 +984,30 @@ class Backend: Equatable {
                         }
                         continuation.finish()
                     } catch {
-                        continuation.finish(throwing: error)
+                        // CRITICAL FIX: Handle timeout errors during streaming
+                        // Check if this is a timeout error that should be retried
+                        if (self.isTimeoutError(error) || self.isThrottlingException(error))
+                            && retryCount < maxRetries
+                        {
+                            let errorType =
+                                self.isThrottlingException(error)
+                                ? "ThrottlingException" : "Timeout"
+                            let waitTime = 30
+
+                            self.logger.warning(
+                                "\(errorType) detected during streaming (attempt \(retryCount + 1)/\(maxRetries + 1)). Waiting \(waitTime) seconds before retry..."
+                            )
+
+                            // Signal retry to the caller by throwing a specific error
+                            continuation.finish(
+                                throwing: StreamingRetryableError(
+                                    originalError: error,
+                                    retryCount: retryCount,
+                                    errorType: errorType
+                                ))
+                        } else {
+                            continuation.finish(throwing: error)
+                        }
                     }
                 }
             }
@@ -1659,6 +1682,13 @@ enum BedrockRuntimeError: Error {
     case invalidURL
     case requestFailed
     case decodingFailed
+}
+
+/// Error type to signal that a streaming operation should be retried
+struct StreamingRetryableError: Error {
+    let originalError: Error
+    let retryCount: Int
+    let errorType: String
 }
 
 // MARK: - NSAlert Extension for Error Handling
